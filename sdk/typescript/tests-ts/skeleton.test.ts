@@ -82,7 +82,10 @@ describe("TypeScript package skeleton", () => {
     expect(packageJson.scripts.test).toBe(
       "bun test --timeout 30000 ./tests-ts",
     );
-    expect(ciWorkflow).toContain("run: pnpm --dir sdk/typescript run test\n");
+    expect(ciWorkflow).toContain(
+      "runner.os == 'Windows' && 'node sdk/typescript/scripts/run-windows-ci-tests.mjs'",
+    );
+    expect(ciWorkflow).toContain("|| 'pnpm --dir sdk/typescript run test'");
     expect(ciWorkflow).not.toContain("--timeout 60000");
   });
 
