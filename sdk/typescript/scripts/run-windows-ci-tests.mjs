@@ -33,9 +33,26 @@ if (
   throw new Error("Windows CI test shards must run every test file once.");
 }
 
+const requestedShard =
+  process.argv[2] === undefined
+    ? undefined
+    : Number.parseInt(process.argv[2], 10);
+if (
+  requestedShard !== undefined &&
+  (!Number.isSafeInteger(requestedShard) ||
+    requestedShard < 1 ||
+    requestedShard > shards.length)
+) {
+  throw new Error("Usage: node scripts/run-windows-ci-tests.mjs [1-4]");
+}
+const selectedShards =
+  requestedShard === undefined
+    ? shards.map((files, index) => ({ files, index }))
+    : [{ files: shards[requestedShard - 1], index: requestedShard - 1 }];
+
 const results = await Promise.all(
-  shards.map(
-    (files, index) =>
+  selectedShards.map(
+    ({ files, index }) =>
       new Promise((resolve, reject) => {
         console.log(
           "Windows CI test shard " +
