@@ -36,8 +36,15 @@ for (const file of assigned) {
   }
 }
 const unassigned = tests.filter((file) => !assigned.has(file));
+const slowRemainderFiles = new Set([
+  "deep-scan-workbench.test.ts",
+  "release-automation.test.ts",
+  "scan-comparison.test.ts",
+]);
 for (const [index, file] of unassigned.entries()) {
-  shardSeeds[5 + (index % 2)].files.push(file);
+  shardSeeds[slowRemainderFiles.has(file) ? 6 : 5 + (index % 2)].files.push(
+    file,
+  );
 }
 
 const assignments = new Map();
