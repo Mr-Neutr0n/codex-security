@@ -140,15 +140,11 @@ jobs:
         uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         with:
           package_json_file: sdk/typescript/package.json
-          cache: true
-          cache_dependency_path: sdk/typescript/pnpm-lock.yaml
 
       - name: Set up Node.js
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
         with:
           node-version: ${{ matrix.node }}
-          cache: npm
-          cache-dependency-path: sdk/typescript/pnpm-lock.yaml
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -198,8 +194,6 @@ jobs:
         uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         with:
           package_json_file: sdk/typescript/package.json
-          cache: true
-          cache_dependency_path: sdk/typescript/pnpm-lock.yaml
 
       - name: Set up Node.js
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
