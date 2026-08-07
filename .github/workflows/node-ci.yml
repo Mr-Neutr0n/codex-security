@@ -142,8 +142,7 @@ jobs:
           node-version: ${{ matrix.node }}
 
       - name: Set up pnpm
-        working-directory: sdk/typescript
-        run: corepack enable && corepack install
+        run: npm install --global pnpm@11.9.0 --no-audit --no-fund
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -198,8 +197,7 @@ jobs:
           cache-dependency-path: sdk/typescript/pnpm-lock.yaml
 
       - name: Set up pnpm
-        working-directory: sdk/typescript
-        run: corepack enable && corepack install
+        run: npm install --global pnpm@11.9.0 --no-audit --no-fund
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
