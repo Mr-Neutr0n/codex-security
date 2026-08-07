@@ -7,30 +7,50 @@ const packageDirectory = fileURLToPath(new URL("../", import.meta.url));
 const tests = (await readdir(testsDirectory))
   .filter((file) => file.endsWith(".test.ts"))
   .sort();
+const slowApiTests = [
+  "keeps a private preflight snapshot isolated from persistent credentials",
+  "reuses keyring-compatible credentials across separate scan clients",
+  "serializes parallel scans sharing a managed credential home",
+  "recreates isolated and managed runtimes when scan authentication changes",
+  "does not reimport ambient credentials after an explicit logout",
+].join("|");
 const shardSeeds = [
-  ["api.test.ts"],
-  ["runtime.test.ts"],
-  ["cli-authentication.test.ts", "scan-recovery.test.ts"],
-  [],
+  {
+    files: ["api.test.ts"],
+    testNamePattern: slowApiTests,
+  },
+  {
+    files: ["api.test.ts"],
+    testNamePattern: `^(?!.*(?:${slowApiTests})).*$`,
+  },
+  { files: ["runtime.test.ts"] },
+  { files: ["cli-authentication.test.ts"] },
+  { files: ["scan-recovery.test.ts"] },
+  { files: [] },
+  { files: [] },
 ];
-const assigned = new Set(shardSeeds.flat());
+const assigned = new Set(shardSeeds.flatMap(({ files }) => files));
 for (const file of assigned) {
   if (!tests.includes(file)) {
     throw new Error("Windows CI test shard references a missing file: " + file);
   }
 }
-for (const file of tests) {
-  if (!assigned.has(file)) shardSeeds[3].push(file);
+const unassigned = tests.filter((file) => !assigned.has(file));
+for (const [index, file] of unassigned.entries()) {
+  shardSeeds[5 + (index % 2)].files.push(file);
 }
 
-const shards = shardSeeds.map((files) =>
-  files.map((file) => "./tests-ts/" + file),
-);
-if (
-  shards.flat().length !== tests.length ||
-  new Set(shards.flat()).size !== tests.length
-) {
-  throw new Error("Windows CI test shards must run every test file once.");
+const assignments = new Map();
+for (const { files } of shardSeeds) {
+  for (const file of files) {
+    assignments.set(file, (assignments.get(file) ?? 0) + 1);
+  }
+}
+for (const file of tests) {
+  const expectedAssignments = file === "api.test.ts" ? 2 : 1;
+  if (assignments.get(file) !== expectedAssignments) {
+    throw new Error("Windows CI test shards must run every test file.");
+  }
 }
 
 const requestedShard =
@@ -41,28 +61,37 @@ if (
   requestedShard !== undefined &&
   (!Number.isSafeInteger(requestedShard) ||
     requestedShard < 1 ||
-    requestedShard > shards.length)
+    requestedShard > shardSeeds.length)
 ) {
-  throw new Error("Usage: node scripts/run-windows-ci-tests.mjs [1-4]");
+  throw new Error("Usage: node scripts/run-windows-ci-tests.mjs [1-7]");
 }
 const selectedShards =
   requestedShard === undefined
-    ? shards.map((files, index) => ({ files, index }))
-    : [{ files: shards[requestedShard - 1], index: requestedShard - 1 }];
+    ? shardSeeds.map((shard, index) => ({ ...shard, index }))
+    : [{ ...shardSeeds[requestedShard - 1], index: requestedShard - 1 }];
 
 const results = await Promise.all(
   selectedShards.map(
-    ({ files, index }) =>
+    ({ files, index, testNamePattern }) =>
       new Promise((resolve, reject) => {
+        const paths = files.map((file) => "./tests-ts/" + file);
         console.log(
           "Windows CI test shard " +
             (index + 1) +
             "/" +
-            shards.length +
+            shardSeeds.length +
             ": " +
-            files.join(" "),
+            paths.join(" ") +
+            (testNamePattern === undefined
+              ? ""
+              : " --test-name-pattern " + testNamePattern),
         );
-        const child = spawn("bun", ["test", "--timeout", "30000", ...files], {
+        const args = ["test", "--timeout", "30000"];
+        if (testNamePattern !== undefined) {
+          args.push("--test-name-pattern", testNamePattern);
+        }
+        args.push(...paths);
+        const child = spawn("bun", args, {
           cwd: packageDirectory,
           stdio: "inherit",
           windowsHide: true,
