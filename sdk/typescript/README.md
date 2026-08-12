@@ -25,6 +25,47 @@ When a newer version is available, the CLI shows the update command for your
 installation method. Set `CODEX_SECURITY_NO_UPDATE_NOTICE=1` to hide the
 notice. Notices are also disabled in CI and when stderr is not a terminal.
 
+## Release and bundle provenance
+
+A published package contains several independently versioned layers. The npm
+package version is the release anchor, while the bundled plugin and the Codex
+runtime dependencies have their own version fields:
+
+| Layer          | Source of truth                                                          | What it identifies                                                |
+| -------------- | ------------------------------------------------------------------------ | ----------------------------------------------------------------- |
+| npm package    | `sdk/typescript/package.json` and the `npm-vX.Y.Z` tag                   | The published SDK and CLI release                                 |
+| bundled plugin | `_bundled_plugin/.codex-plugin/plugin.json` and `BUNDLED_PLUGIN_VERSION` | The plugin manifest and compatibility version, not a content hash |
+| Codex runtime  | `@openai/codex` and `@openai/codex-sdk` in `package.json`                | The runtime and SDK dependency versions used by the package       |
+
+For an exact, byte-for-byte reference to the bundled plugin, use its Git tree
+object at the release tag. For example, replace `0.1.5` with the release you
+are checking:
+
+```bash
+VERSION=0.1.5
+TAG="npm-v${VERSION}"
+
+git rev-parse "${TAG}^{commit}"
+git rev-parse "${TAG}:sdk/typescript/_bundled_plugin"
+git show "${TAG}:sdk/typescript/package.json" | jq -r .version
+git show "${TAG}:sdk/typescript/_bundled_plugin/.codex-plugin/plugin.json" | jq -r .version
+```
+
+The first two values form the immutable release-to-bundle mapping. The npm
+registry also records the published package's release commit and integrity
+metadata:
+
+```bash
+npm view "@openai/codex-security@${VERSION}" version gitHead dist.integrity
+```
+
+`bundledPluginVersion` in `codex-security info --json` is useful diagnostic
+metadata, but it does not replace the bundled tree hash. A runtime or catalog
+version supplied by the Codex distribution is external to this repository and
+cannot be inferred from the npm tag or the plugin manifest. Record that value
+from the runtime's own release metadata alongside the package tag and bundled
+tree hash when producing a provenance report.
+
 ## Run a scan from TypeScript
 
 Sign in with `npx @openai/codex-security login` or set `OPENAI_API_KEY` or
