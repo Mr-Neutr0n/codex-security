@@ -58,7 +58,7 @@ if (args.join(" ") === "login --with-api-key") {
   console.error("Listening on http://[::ffff:127.0.0.1]:1455.");
   console.error("Listening on http://[::ffff:0.0.0.0]:1455.");
   console.error("Listening on http://[::127.0.0.1]:1455.");
-  console.error("Open \\u001b[32mhttps://127.auth.example.test/device\\u001b[0m");
+  console.error('Open "\\u001b[32mhttps://127.auth.example.test/device\\u001b[0m"');
   console.error("Enter this one-time code");
   console.error("\\u001b[36m8356-V2EGR\\u001b[0m");
   process.exit(0);
@@ -100,6 +100,26 @@ describe("Codex authentication process boundary", () => {
     ).resolves.toMatchObject({ success: false, exitCode: 1 });
   });
 
+  test("retains large noninteractive authentication output", async () => {
+    const root = await mkdtemp(join(tmpdir(), "codex-security-auth-output-"));
+    temporaryDirectories.push(root);
+    const output = "verbose authentication output ".repeat(3_000);
+    for (const stream of ["stdout", "stderr"] as const) {
+      const script = join(root, `${stream}.mjs`);
+      await writeFile(
+        script,
+        `process.${stream}.write(${JSON.stringify(output)}, () => process.exit(0));\n`,
+      );
+      const result = await runCodex(
+        { command: process.execPath, prefixArgs: [script] },
+        [],
+        process.env,
+      );
+      expect(result.success).toBe(true);
+      expect(result[stream]).toBe(output);
+    }
+  });
+
   test("reports account state and performs logout", async () => {
     const command = await fakeCodex();
     await expect(accountStatus(command, process.env)).resolves.toMatchObject({
@@ -109,7 +129,7 @@ describe("Codex authentication process boundary", () => {
     await expect(logout(command, process.env)).resolves.toBeUndefined();
   });
 
-  test("captures interactive login metadata and completion", async () => {
+  test("captures quoted interactive login metadata and completion", async () => {
     const command = await fakeCodex();
     let succeeded = false;
     const handle = new CodexLoginHandle(
@@ -125,6 +145,138 @@ describe("Codex authentication process boundary", () => {
     expect(handle.verificationUrl).toBe("https://127.auth.example.test/device");
     expect(handle.userCode).toBe("8356-V2EGR");
     expect(succeeded).toBe(true);
+  });
+
+  test("retains large interactive output and login instructions", async () => {
+    const root = await mkdtemp(join(tmpdir(), "codex-security-auth-output-"));
+    temporaryDirectories.push(root);
+    const script = join(root, "login.mjs");
+    const output = "verbose authentication output ".repeat(3_000);
+    await writeFile(
+      script,
+      `
+console.error("Open https://auth.example.test/device");
+console.error("User code: ABCD-EFGH");
+setTimeout(() => {
+  process.stderr.write(${JSON.stringify(output)}, () => process.exit(0));
+}, 10);
+`,
+    );
+    let succeeded = false;
+    const handle = new CodexLoginHandle(
+      { command: process.execPath, prefixArgs: [script] },
+      ["login", "--device-auth"],
+      process.env,
+      () => {
+        succeeded = true;
+      },
+    );
+
+    await handle.waitForInstructions({ deviceCode: true });
+    expect(handle.verificationUrl).toBe("https://auth.example.test/device");
+    expect(handle.userCode).toBe("ABCD-EFGH");
+    const result = await handle.wait();
+    expect(result).toMatchObject({ success: true, exitCode: 0, stdout: "" });
+    expect(result.stderr).toContain(output);
+    expect(succeeded).toBe(true);
+  });
+
+  test("ignores authentication instructions hidden in a split terminal escape", async () => {
+    const root = await mkdtemp(join(tmpdir(), "codex-security-auth-escape-"));
+    temporaryDirectories.push(root);
+    const script = join(root, "login.mjs");
+    await writeFile(
+      script,
+      `
+process.stderr.write("\\u001b]0;" + "x".repeat(5 * 1024));
+setTimeout(() => process.stderr.write("https://hidden.example.test/device"), 10);
+setTimeout(() => {
+  process.stderr.write("\\u0007\\nOpen https://auth.example.test/device\\nUser code: SAFE-1234\\n");
+  setTimeout(() => process.exit(0), 10);
+}, 20);
+`,
+    );
+    const handle = new CodexLoginHandle(
+      { command: process.execPath, prefixArgs: [script] },
+      ["login", "--device-auth"],
+      process.env,
+      () => {},
+    );
+
+    await handle.waitForInstructions({ deviceCode: true });
+    expect(handle.verificationUrl).toBe("https://auth.example.test/device");
+    expect(handle.userCode).toBe("SAFE-1234");
+    await expect(handle.wait()).resolves.toMatchObject({ success: true });
+  });
+
+  test("waits for complete login instructions split across output chunks", async () => {
+    const root = await mkdtemp(join(tmpdir(), "codex-security-auth-fragment-"));
+    temporaryDirectories.push(root);
+    const script = join(root, "login.mjs");
+    await writeFile(
+      script,
+      `
+process.stderr.write("Open https://auth.example");
+setTimeout(() => process.stderr.write(".test/device\\nUser code: ABCD"), 10);
+setTimeout(() => {
+  process.stderr.write("-EFGH\\n");
+  setTimeout(() => process.exit(0), 10);
+}, 20);
+`,
+    );
+    const handle = new CodexLoginHandle(
+      { command: process.execPath, prefixArgs: [script] },
+      ["login", "--device-auth"],
+      process.env,
+      () => {},
+    );
+
+    await handle.waitForInstructions({ deviceCode: true });
+    expect(handle.verificationUrl).toBe("https://auth.example.test/device");
+    expect(handle.userCode).toBe("ABCD-EFGH");
+    await expect(handle.wait()).resolves.toMatchObject({ success: true });
+  });
+
+  test("recognizes carriage-return-separated interactive login instructions", async () => {
+    const root = await mkdtemp(join(tmpdir(), "codex-security-auth-carriage-"));
+    temporaryDirectories.push(root);
+    const script = join(root, "login.mjs");
+    await writeFile(
+      script,
+      'process.stderr.write("Open https://auth.example.test/device\\rUser code: ABCD-EFGH\\r"); setTimeout(() => process.exit(0), 25);\n',
+    );
+    const handle = new CodexLoginHandle(
+      { command: process.execPath, prefixArgs: [script] },
+      ["login", "--device-auth"],
+      process.env,
+      () => {},
+    );
+
+    await handle.waitForInstructions({ deviceCode: true });
+    expect(handle.verificationUrl).toBe("https://auth.example.test/device");
+    expect(handle.userCode).toBe("ABCD-EFGH");
+    await expect(handle.wait()).resolves.toMatchObject({ success: true });
+  });
+
+  test("preserves login instructions on long output lines", async () => {
+    const root = await mkdtemp(join(tmpdir(), "codex-security-auth-tail-"));
+    temporaryDirectories.push(root);
+    const script = join(root, "login.mjs");
+    await writeFile(
+      script,
+      'process.stderr.write("Open https://auth.example.test/device " + "x".repeat(128 * 1024), () => process.stderr.write("\\nUser code: ABCD-EFGH\\n", () => process.exit(0)));\n',
+    );
+    const handle = new CodexLoginHandle(
+      { command: process.execPath, prefixArgs: [script] },
+      ["login", "--device-auth"],
+      process.env,
+      () => {},
+    );
+
+    await handle.waitForInstructions({ deviceCode: true });
+    expect(handle.verificationUrl).toBe("https://auth.example.test/device");
+    expect(handle.userCode).toBe("ABCD-EFGH");
+    await expect(handle.wait()).resolves.toMatchObject({ success: true });
   });
 
   test("drains native login stderr before resolving authentication", async () => {
@@ -236,15 +388,13 @@ grandchild.once("error", (error) => {
     },
   );
 
-  test.skipIf(process.platform !== "win32")(
-    "releases native login pipes when the Windows fallback fires",
-    async () => {
-      const root = await mkdtemp(join(tmpdir(), "codex-security-auth-pipes-"));
-      temporaryDirectories.push(root);
-      const ready = join(root, "grandchild-ready");
-      const release = join(root, "release-grandchild");
-      const script = join(root, "login-pipes.mjs");
-      const grandchildScript = `
+  test("releases native login pipes when the cross-platform fallback fires", async () => {
+    const root = await mkdtemp(join(tmpdir(), "codex-security-auth-pipes-"));
+    temporaryDirectories.push(root);
+    const ready = join(root, "grandchild-ready");
+    const release = join(root, "release-grandchild");
+    const script = join(root, "login-pipes.mjs");
+    const grandchildScript = `
 import { existsSync, writeFileSync } from "node:fs";
 
 const ready = process.argv[1];
@@ -258,9 +408,9 @@ const watcher = setInterval(() => {
 }, 25);
 writeFileSync(ready, String(process.pid));
 `;
-      await writeFile(
-        script,
-        `
+    await writeFile(
+      script,
+      `
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 
@@ -292,103 +442,137 @@ grandchild.once("error", (error) => {
   process.exit(1);
 });
 `,
+    );
+
+    const originalOnce = ChildProcess.prototype.once;
+    let loginChild: ChildProcess | undefined;
+    const processObserver = spyOn(ChildProcess.prototype, "once");
+    processObserver.mockImplementation(function (
+      this: ChildProcess,
+      event: string,
+      listener: (...eventArguments: never[]) => void,
+    ) {
+      if (event === "exit") loginChild = this;
+      return Reflect.apply(originalOnce, this, [event, listener]);
+    });
+
+    let handle: CodexLoginHandle;
+    try {
+      handle = new CodexLoginHandle(
+        { command: process.execPath, prefixArgs: [script] },
+        ["login"],
+        process.env,
+        () => {},
       );
+    } finally {
+      processObserver.mockRestore();
+    }
 
-      const originalOnce = ChildProcess.prototype.once;
-      let loginChild: ChildProcess | undefined;
-      const processObserver = spyOn(ChildProcess.prototype, "once");
-      processObserver.mockImplementation(function (
-        this: ChildProcess,
-        event: string,
-        listener: (...eventArguments: never[]) => void,
-      ) {
-        if (event === "exit") loginChild = this;
-        return Reflect.apply(originalOnce, this, [event, listener]);
-      });
-
-      let handle: CodexLoginHandle;
-      try {
-        handle = new CodexLoginHandle(
-          { command: process.execPath, prefixArgs: [script] },
-          ["login"],
-          process.env,
-          () => {},
-        );
-      } finally {
-        processObserver.mockRestore();
+    const readMarker = async (path: string): Promise<string> => {
+      const deadline = Date.now() + 5_000;
+      while (true) {
+        try {
+          return await readFile(path, "utf8");
+        } catch (error) {
+          if (
+            !(error instanceof Error) ||
+            !("code" in error) ||
+            error.code !== "ENOENT" ||
+            Date.now() >= deadline
+          ) {
+            throw error;
+          }
+          await delay(25);
+        }
       }
+    };
 
-      const readMarker = async (path: string): Promise<string> => {
+    let grandchildPid: number | undefined;
+    try {
+      const readyMarker = await readMarker(ready);
+      expect(readyMarker).toMatch(/^\d+$/u);
+      grandchildPid = Number(readyMarker);
+      expect(Number.isSafeInteger(grandchildPid)).toBe(true);
+      expect(grandchildPid).toBeGreaterThan(0);
+      const timeout = AbortSignal.timeout(5_000);
+      const completion = Promise.race([
+        handle.wait(),
+        new Promise<never>((_, reject) => {
+          timeout.addEventListener(
+            "abort",
+            () => reject(new Error("The login fallback timed out.")),
+            { once: true },
+          );
+        }),
+      ]);
+      await expect(completion).resolves.toMatchObject({
+        success: true,
+        exitCode: 0,
+      });
+      expect(loginChild?.stdout?.destroyed).toBe(true);
+      expect(loginChild?.stderr?.destroyed).toBe(true);
+    } finally {
+      await writeFile(release, "released");
+      if (grandchildPid !== undefined) {
         const deadline = Date.now() + 5_000;
         while (true) {
           try {
-            return await readFile(path, "utf8");
+            process.kill(grandchildPid, 0);
           } catch (error) {
             if (
-              !(error instanceof Error) ||
-              !("code" in error) ||
-              error.code !== "ENOENT" ||
-              Date.now() >= deadline
+              error instanceof Error &&
+              "code" in error &&
+              error.code === "ESRCH"
             ) {
-              throw error;
+              break;
             }
-            await delay(25);
+            throw error;
           }
-        }
-      };
-
-      let grandchildPid: number | undefined;
-      try {
-        const readyMarker = await readMarker(ready);
-        expect(readyMarker).toMatch(/^\d+$/u);
-        grandchildPid = Number(readyMarker);
-        expect(Number.isSafeInteger(grandchildPid)).toBe(true);
-        expect(grandchildPid).toBeGreaterThan(0);
-        const timeout = AbortSignal.timeout(5_000);
-        const completion = Promise.race([
-          handle.wait(),
-          new Promise<never>((_, reject) => {
-            timeout.addEventListener(
-              "abort",
-              () => reject(new Error("The Windows login fallback timed out.")),
-              { once: true },
+          if (Date.now() >= deadline) {
+            throw new Error(
+              "The login grandchild did not exit after pipe cleanup.",
             );
-          }),
-        ]);
-        await expect(completion).resolves.toMatchObject({
-          success: true,
-          exitCode: 0,
-        });
-        expect(loginChild?.stdout?.destroyed).toBe(true);
-        expect(loginChild?.stderr?.destroyed).toBe(true);
-      } finally {
-        await writeFile(release, "released");
-        if (grandchildPid !== undefined) {
-          const deadline = Date.now() + 5_000;
-          while (true) {
-            try {
-              process.kill(grandchildPid, 0);
-            } catch (error) {
-              if (
-                error instanceof Error &&
-                "code" in error &&
-                error.code === "ESRCH"
-              ) {
-                break;
-              }
-              throw error;
-            }
-            if (Date.now() >= deadline) {
-              throw new Error(
-                "The Windows login grandchild did not exit after pipe cleanup.",
-              );
-            }
-            await delay(25);
           }
+          await delay(25);
         }
       }
-    },
-  );
+    }
+  });
+
+  test("escalates cancellation when a login child ignores SIGTERM", async () => {
+    const root = await mkdtemp(join(tmpdir(), "codex-security-auth-sigkill-"));
+    temporaryDirectories.push(root);
+    const script = join(root, "codex.mjs");
+    await writeFile(
+      script,
+      `
+console.error("Open https://auth.example.test/device");
+console.error("User code: ABCD-EFGH");
+process.on("SIGTERM", () => {});
+setInterval(() => {}, 1000);
+`,
+    );
+    let succeeded = false;
+    const handle = new CodexLoginHandle(
+      { command: process.execPath, prefixArgs: [script] },
+      ["login", "--device-auth"],
+      process.env,
+      () => {
+        succeeded = true;
+      },
+    );
+    await handle.waitForInstructions({ deviceCode: true });
+    handle.cancel();
+    await expect(
+      Promise.race([
+        handle.wait(),
+        delay(5_000).then(() => {
+          throw new Error("Login cancellation did not settle.");
+        }),
+      ]),
+    ).resolves.toMatchObject({ success: false });
+    expect(succeeded).toBe(false);
+  });
 
   test("does not report a canceled interactive login as successful", async () => {
     const root = await mkdtemp(join(tmpdir(), "codex-security-auth-cancel-"));

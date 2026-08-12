@@ -3,6 +3,9 @@ import { isIP } from "node:net";
 import { PluginBootstrapError } from "./errors.js";
 import type { CodexCommand, ProcessEnvironment } from "./runtime.js";
 
+const LOGIN_CHILD_TERMINATION_GRACE_MS = 1_000;
+type TerminalEscapeState = "text" | "escape" | "csi" | "osc" | "osc-escape";
+
 export interface LoginResult {
   success: boolean;
   exitCode: number | null;
@@ -27,8 +30,18 @@ export class CodexLoginHandle {
   #urlReadySettled = false;
   #deviceReadySettled = false;
   #canceled = false;
+  #forcedTermination: ReturnType<typeof setTimeout> | undefined;
+  #forceCompletion: (() => void) | null = null;
   #stdout = "";
   #stderr = "";
+  #stdoutInstructionTail = "";
+  #stderrInstructionTail = "";
+  #stdoutTerminalState: TerminalEscapeState = "text";
+  #stderrTerminalState: TerminalEscapeState = "text";
+  #stdoutAuthUrl: string | null = null;
+  #stderrAuthUrl: string | null = null;
+  #stdoutUserCode: string | null = null;
+  #stderrUserCode: string | null = null;
 
   public constructor(
     command: CodexCommand,
@@ -55,29 +68,24 @@ export class CodexLoginHandle {
     this.#child.stdout.setEncoding("utf8");
     this.#child.stderr.setEncoding("utf8");
     this.#child.stdout.on("data", (chunk: string) => {
-      this.#stdout += chunk;
-      this.#notifyInstructions();
+      this.#recordOutput("stdout", chunk);
     });
     this.#child.stderr.on("data", (chunk: string) => {
-      this.#stderr += chunk;
-      this.#notifyInstructions();
+      this.#recordOutput("stderr", chunk);
     });
     this.#completion = new Promise((resolve, reject) => {
-      this.#child.once("error", (error) => {
-        this.#settleInstructionWaiters({
-          success: false,
-          exitCode: null,
-          stdout: this.#stdout,
-          stderr: error.message,
-        });
-        reject(error);
-      });
       let fallback: ReturnType<typeof setTimeout> | undefined;
       let completed = false;
       const complete = (exitCode: number | null): void => {
         if (completed) return;
         completed = true;
         if (fallback !== undefined) clearTimeout(fallback);
+        this.#clearForcedTermination();
+        this.#forceCompletion = null;
+        this.#destroyPipes();
+        if (!this.#canceled) {
+          this.#flushInstructionTails();
+        }
         const result = {
           success: exitCode === 0 && !this.#canceled,
           exitCode,
@@ -88,14 +96,28 @@ export class CodexLoginHandle {
         if (result.success) onSuccess();
         resolve(result);
       };
+      this.#forceCompletion = () => complete(this.#child.exitCode);
+      this.#child.once("error", (error) => {
+        if (completed) return;
+        completed = true;
+        if (fallback !== undefined) clearTimeout(fallback);
+        this.#clearForcedTermination();
+        this.#forceCompletion = null;
+        this.#destroyPipes();
+        this.#settleInstructionWaiters({
+          success: false,
+          exitCode: null,
+          stdout: this.#stdout,
+          stderr: error.message,
+        });
+        reject(error);
+      });
       this.#child.once("close", complete);
       this.#child.once("exit", (exitCode) => {
-        if (process.platform !== "win32") return;
         fallback = setTimeout(() => {
-          this.#child.stdout.destroy();
-          this.#child.stderr.destroy();
+          this.#destroyPipes();
           complete(exitCode);
-        }, 1_000);
+        }, LOGIN_CHILD_TERMINATION_GRACE_MS);
       });
     });
   }
@@ -105,7 +127,7 @@ export class CodexLoginHandle {
   }
 
   public get authUrl(): string | null {
-    return preferredAuthUrl(`${this.#stdout}\n${this.#stderr}`);
+    return this.#stdoutAuthUrl ?? this.#stderrAuthUrl;
   }
 
   public get verificationUrl(): string | null {
@@ -113,12 +135,7 @@ export class CodexLoginHandle {
   }
 
   public get userCode(): string | null {
-    const output = plainTerminalText(`${this.#stdout}\n${this.#stderr}`);
-    return (
-      output.match(/(?:code|user code)\s*[:=]\s*([A-Z0-9-]{4,})/i)?.[1] ??
-      output.match(/\b[A-Z0-9]{4,}(?:-[A-Z0-9]{4,})+\b/)?.[0] ??
-      null
-    );
+    return this.#stdoutUserCode ?? this.#stderrUserCode;
   }
 
   public async wait(): Promise<LoginResult> {
@@ -132,10 +149,91 @@ export class CodexLoginHandle {
   }
 
   public cancel(): void {
-    if (this.#child.exitCode === null) {
-      this.#canceled = true;
-      this.#child.kill("SIGTERM");
+    this.#canceled = true;
+    this.#requestTermination();
+  }
+
+  #requestTermination(): void {
+    if (
+      this.#child.exitCode !== null ||
+      this.#child.signalCode !== null ||
+      this.#forceCompletion === null
+    ) {
+      this.#destroyPipes();
+      this.#forceCompletion?.();
+      return;
     }
+    this.#child.kill("SIGTERM");
+    if (this.#forcedTermination !== undefined) return;
+    this.#forcedTermination = setTimeout(() => {
+      this.#forcedTermination = undefined;
+      if (this.#child.exitCode === null && this.#child.signalCode === null) {
+        this.#child.kill("SIGKILL");
+      }
+      this.#destroyPipes();
+      this.#forceCompletion?.();
+    }, LOGIN_CHILD_TERMINATION_GRACE_MS);
+  }
+
+  #clearForcedTermination(): void {
+    if (this.#forcedTermination === undefined) return;
+    clearTimeout(this.#forcedTermination);
+    this.#forcedTermination = undefined;
+  }
+
+  #destroyPipes(): void {
+    this.#child.stdin.destroy();
+    this.#child.stdout.destroy();
+    this.#child.stderr.destroy();
+  }
+
+  #recordOutput(stream: "stdout" | "stderr", chunk: string): void {
+    if (stream === "stdout") {
+      this.#stdout += chunk;
+    } else {
+      this.#stderr += chunk;
+    }
+
+    const tail =
+      stream === "stdout"
+        ? this.#stdoutInstructionTail
+        : this.#stderrInstructionTail;
+    const visible = visibleTerminalChunk(
+      chunk,
+      stream === "stdout"
+        ? this.#stdoutTerminalState
+        : this.#stderrTerminalState,
+    );
+    const lastDelimiter = visible.text.lastIndexOf("\n");
+    const completed =
+      lastDelimiter === -1
+        ? ""
+        : `${tail}${visible.text.slice(0, lastDelimiter + 1)}`;
+    const url = preferredAuthUrl(completed);
+    const userCode = userCodeFromOutput(completed);
+    const nextTail =
+      lastDelimiter === -1
+        ? `${tail}${visible.text}`
+        : visible.text.slice(lastDelimiter + 1);
+    if (stream === "stdout") {
+      this.#stdoutAuthUrl ??= url;
+      this.#stdoutUserCode ??= userCode;
+      this.#stdoutInstructionTail = nextTail;
+      this.#stdoutTerminalState = visible.state;
+    } else {
+      this.#stderrAuthUrl ??= url;
+      this.#stderrUserCode ??= userCode;
+      this.#stderrInstructionTail = nextTail;
+      this.#stderrTerminalState = visible.state;
+    }
+    this.#notifyInstructions();
+  }
+
+  #flushInstructionTails(): void {
+    this.#stdoutAuthUrl ??= preferredAuthUrl(this.#stdoutInstructionTail);
+    this.#stdoutUserCode ??= userCodeFromOutput(this.#stdoutInstructionTail);
+    this.#stderrAuthUrl ??= preferredAuthUrl(this.#stderrInstructionTail);
+    this.#stderrUserCode ??= userCodeFromOutput(this.#stderrInstructionTail);
   }
 
   #notifyInstructions(): void {
@@ -256,6 +354,27 @@ export async function runCodex(
   });
   let stdout = "";
   let stderr = "";
+  let processError: Error | null = null;
+  let forcedTermination: ReturnType<typeof setTimeout> | undefined;
+  const terminate = (): void => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      child.stdin.destroy();
+      child.stdout.destroy();
+      child.stderr.destroy();
+      return;
+    }
+    child.kill("SIGTERM");
+    if (forcedTermination !== undefined) return;
+    forcedTermination = setTimeout(() => {
+      forcedTermination = undefined;
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+      }
+      child.stdin.destroy();
+      child.stdout.destroy();
+      child.stderr.destroy();
+    }, LOGIN_CHILD_TERMINATION_GRACE_MS);
+  };
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
   child.stdout.on("data", (chunk: string) => {
@@ -265,9 +384,9 @@ export async function runCodex(
     stderr += chunk;
   });
   const completion = new Promise<LoginResult>((resolve, reject) => {
-    let processError: Error | null = null;
     child.once("error", (error) => {
-      processError = error;
+      processError ??= error;
+      terminate();
     });
     child.stdin.on("error", (error: NodeJS.ErrnoException) => {
       // A short-lived command can close stdin before Node flushes the input.
@@ -283,6 +402,7 @@ export async function runCodex(
       }
     });
     child.once("close", (exitCode) => {
+      if (forcedTermination !== undefined) clearTimeout(forcedTermination);
       if (processError !== null) {
         reject(processError);
       } else {
@@ -295,28 +415,38 @@ export async function runCodex(
 }
 
 function preferredAuthUrl(value: string): string | null {
-  const urls = [
-    ...plainTerminalText(value).matchAll(/https?:\/\/[^\s<>]+/g),
-  ].map((match) => match[0].replace(/[.,;:!?)\]}]+$/, ""));
-  return (
-    urls.find((url) => {
-      try {
-        const hostname = new URL(url).hostname.toLowerCase().replace(/\.$/, "");
-        return (
-          hostname !== "localhost" &&
-          !hostname.endsWith(".localhost") &&
-          !(isIP(hostname) === 4 && hostname.startsWith("127.")) &&
-          hostname !== "0.0.0.0" &&
-          hostname !== "[::1]" &&
-          hostname !== "[::]" &&
-          hostname !== "[::ffff:0:0]" &&
-          !hostname.startsWith("[::ffff:7f") &&
-          !hostname.startsWith("[::7f")
-        );
-      } catch {
-        return false;
+  for (const match of plainTerminalText(value).matchAll(
+    /https?:\/\/[^\s<>"']+/g,
+  )) {
+    const url = match[0].replace(/[.,;:!?)\]}]+$/, "");
+    try {
+      const hostname = new URL(url).hostname.toLowerCase().replace(/\.$/, "");
+      if (
+        hostname !== "localhost" &&
+        !hostname.endsWith(".localhost") &&
+        !(isIP(hostname) === 4 && hostname.startsWith("127.")) &&
+        hostname !== "0.0.0.0" &&
+        hostname !== "[::1]" &&
+        hostname !== "[::]" &&
+        hostname !== "[::ffff:0:0]" &&
+        !hostname.startsWith("[::ffff:7f") &&
+        !hostname.startsWith("[::7f")
+      ) {
+        return url;
       }
-    }) ?? null
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+function userCodeFromOutput(value: string): string | null {
+  const output = plainTerminalText(value);
+  return (
+    output.match(/(?:code|user code)\s*[:=]\s*([A-Z0-9-]{4,})/i)?.[1] ??
+    output.match(/\b[A-Z0-9]{4,}(?:-[A-Z0-9]{4,})+\b/)?.[0] ??
+    null
   );
 }
 
@@ -325,4 +455,45 @@ function plainTerminalText(value: string): string {
     .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "")
     .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
     .replace(/\r/g, "");
+}
+
+function visibleTerminalChunk(
+  value: string,
+  initialState: TerminalEscapeState,
+): { text: string; state: TerminalEscapeState } {
+  let state = initialState;
+  let text = "";
+  for (const character of value) {
+    if (state === "text") {
+      if (character === "\u001b") {
+        state = "escape";
+      } else {
+        text += character === "\r" ? "\n" : character;
+      }
+      continue;
+    }
+    if (state === "escape") {
+      if (character === "[") {
+        state = "csi";
+      } else if (character === "]") {
+        state = "osc";
+      } else {
+        text += `\u001b${character}`;
+        state = "text";
+      }
+      continue;
+    }
+    if (state === "csi") {
+      if (character >= "@" && character <= "~") state = "text";
+      continue;
+    }
+    if (state === "osc") {
+      if (character === "\u0007") state = "text";
+      else if (character === "\u001b") state = "osc-escape";
+      continue;
+    }
+    if (character === "\\" || character === "\u0007") state = "text";
+    else if (character !== "\u001b") state = "osc";
+  }
+  return { text, state };
 }

@@ -1,6 +1,8 @@
+import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { describe, expect, test } from "bun:test";
 import {
   main,
@@ -58,6 +60,8 @@ describe("CLI skill commands", () => {
           'model_reasoning_effort="xhigh"',
           "--config",
           'approval_policy="never"',
+          "--config",
+          'responses_api_metadata.codex_security_surface="cli"',
           "--sandbox",
           "workspace-write",
           "--skip-git-repo-check",
@@ -345,23 +349,17 @@ describe("CLI skill commands", () => {
     }
   });
 
-  test("rejects empty, non-file, and oversized skill inputs before launching Codex", async () => {
+  test("rejects empty and non-file skill inputs before launching Codex", async () => {
     const directory = await mkdtemp(
       join(tmpdir(), "codex-security-skill-inputs-"),
     );
     try {
       await mkdir(join(directory, "nested"));
-      await writeFile(
-        join(directory, "oversized.txt"),
-        Buffer.alloc(1024 * 1024 + 1),
-      );
       await writeFile(join(directory, "empty.txt"), " \n\t");
       const invalidInputs = [
         ["   ", "must not be empty"],
         ["nested", "must be files or literal text"],
         ["empty.txt", "must not be empty"],
-        ["oversized.txt", "exceeds the 1 MiB limit"],
-        ["x".repeat(1024 * 1024 + 1), "exceeds the 1 MiB limit"],
       ];
       for (const [input, expected] of invalidInputs) {
         let started = false;
@@ -383,25 +381,43 @@ describe("CLI skill commands", () => {
         expect(stderr.text()).toContain(expected!);
         expect(started).toBe(false);
       }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
 
-      let started = false;
-      const tooMany = capture();
-      expect(
-        await main(
-          ["patch", ...Array.from({ length: 65 }, () => "issue")],
-          capture().stream,
-          tooMany.stream,
-          dependencies({
-            currentDirectory: directory,
-            onCodex: () => {
-              started = true;
-              return 0;
-            },
-          }),
-        ),
-      ).toBe(2);
-      expect(tooMany.text()).toContain("64-item limit");
-      expect(started).toBe(false);
+  test("accepts large skill inputs and more than 64 findings", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "codex-security-skill-large-inputs-"),
+    );
+    try {
+      const largeInput = "x".repeat(1024 * 1024 + 1);
+      await writeFile(join(directory, "large.txt"), largeInput);
+
+      for (const inputs of [
+        ["large.txt"],
+        [largeInput],
+        Array.from({ length: 65 }, () => "issue"),
+      ]) {
+        let received: string[] = [];
+        expect(
+          await main(
+            ["validate", ...inputs],
+            capture().stream,
+            capture().stream,
+            dependencies({
+              currentDirectory: directory,
+              onCodex: (args) => {
+                received = JSON.parse(args.at(-1)!.split("\n").at(-1)!);
+                return 0;
+              },
+            }),
+          ),
+        ).toBe(0);
+        expect(received).toEqual(
+          inputs[0] === "large.txt" ? [largeInput] : inputs,
+        );
+      }
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -453,6 +469,61 @@ describe("CLI skill commands", () => {
       message: "Café 🔒",
       malformed: false,
     });
+  });
+
+  test("accepts skill events and responses larger than 16 MiB", async () => {
+    let drained = false;
+    async function* oversizedLine(): AsyncGenerator<Buffer> {
+      for (let remaining = 1_024 * 1_024 + 1; remaining > 0; ) {
+        const length = Math.min(64 * 1_024, remaining);
+        yield Buffer.alloc(length, 0x78);
+        remaining -= length;
+      }
+      yield Buffer.from(
+        '\n{"type":"item.completed","item":{"type":"agent_message","text":"must still drain"}}\n',
+      );
+      drained = true;
+    }
+    await expect(readSkillCommandOutput(oversizedLine())).resolves.toEqual({
+      message: "must still drain",
+      malformed: true,
+    });
+    expect(drained).toBe(true);
+
+    const largeResponse = "x".repeat(16 * 1_024 * 1_024 + 1);
+    async function* oversizedResponse(): AsyncGenerator<Buffer> {
+      yield Buffer.from(
+        `${JSON.stringify({
+          type: "item.completed",
+          item: {
+            type: "agent_message",
+            text: largeResponse,
+          },
+        })}\n`,
+      );
+    }
+    await expect(readSkillCommandOutput(oversizedResponse())).resolves.toEqual({
+      message: largeResponse,
+      malformed: false,
+    });
+
+    const stdout = capture();
+    const stderr = capture();
+    await expect(
+      runCodexSkillCommand(
+        [],
+        { command: "validate", stdout: stdout.stream, stderr: stderr.stream },
+        {
+          command: process.execPath,
+          prefixArgs: [
+            "-e",
+            'process.stdout.write(JSON.stringify({type:"item.completed",item:{type:"agent_message",text:"x".repeat(1024*1024+1)}})+"\\n")',
+          ],
+        },
+      ),
+    ).resolves.toBe(0);
+    expect(stdout.text()).toBe(`${"x".repeat(1024 * 1024 + 1)}\n`);
+    expect(stderr.text()).toBe("");
   });
 
   test("summarizes skill failures without echoing credentials or private paths", () => {
@@ -527,4 +598,95 @@ describe("CLI skill commands", () => {
       expect(stderr.text()).not.toContain("/private");
     }
   });
+
+  test.skipIf(process.platform === "win32")(
+    "forces a skill child to settle when it ignores SIGTERM",
+    async () => {
+      const directory = await mkdtemp(
+        join(tmpdir(), "codex-security-skill-signal-"),
+      );
+      const ready = join(directory, "ready");
+      const child = join(directory, "child.mjs");
+      const wrapper = join(directory, "wrapper.mjs");
+      await writeFile(
+        child,
+        `
+import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+const descendant = spawn(
+  process.execPath,
+  ["-e", "setInterval(() => {}, 1000)"],
+  { stdio: ["ignore", "inherit", "inherit"], windowsHide: true },
+);
+writeFileSync(${JSON.stringify(ready)}, JSON.stringify({
+  child: process.pid,
+  descendant: descendant.pid,
+}));
+process.on("SIGTERM", () => {});
+setInterval(() => {}, 1000);
+`,
+      );
+      await writeFile(
+        wrapper,
+        `
+import { runCodexSkillCommand } from ${JSON.stringify(new URL("../src/cli.ts", import.meta.url).href)};
+const status = await runCodexSkillCommand(
+  [],
+  { command: "validate", stdout: process.stdout, stderr: process.stderr },
+  { command: process.execPath, prefixArgs: [${JSON.stringify(child)}] },
+);
+process.exit(status);
+`,
+      );
+
+      const invocation = spawn(process.execPath, [wrapper], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+      let childPids: number[] = [];
+      try {
+        const deadline = Date.now() + 5_000;
+        while (true) {
+          try {
+            const marker = JSON.parse(await Bun.file(ready).text()) as {
+              child: number;
+              descendant: number;
+            };
+            childPids = [marker.child, marker.descendant];
+            break;
+          } catch (error) {
+            if (Date.now() >= deadline) throw error;
+            await delay(25);
+          }
+        }
+        invocation.kill("SIGTERM");
+        const status = await Promise.race([
+          new Promise<number | null>((resolve, reject) => {
+            invocation.once("error", reject);
+            invocation.once("close", resolve);
+          }),
+          delay(5_000).then(() => {
+            throw new Error("CLI skill cancellation did not settle.");
+          }),
+        ]);
+        expect(status).toBe(143);
+      } finally {
+        invocation.kill("SIGKILL");
+        for (const childPid of childPids) {
+          try {
+            process.kill(childPid, "SIGKILL");
+          } catch (error) {
+            if (
+              !(error instanceof Error) ||
+              !("code" in error) ||
+              error.code !== "ESRCH"
+            ) {
+              throw error;
+            }
+          }
+        }
+        await rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
 });
