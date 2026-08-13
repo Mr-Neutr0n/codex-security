@@ -52,12 +52,34 @@ git show "${TAG}:sdk/typescript/_bundled_plugin/.codex-plugin/plugin.json" | jq 
 ```
 
 The first two values form the immutable release-to-bundle mapping. The npm
-registry also records the published package's release commit and integrity
-metadata:
+registry exposes release metadata that is useful for inspection:
 
 ```bash
 npm view "@openai/codex-security@${VERSION}" version gitHead dist.integrity
 ```
+
+This metadata is not signed provenance verification. To verify the published
+package cryptographically, use npm's signature and attestation audit and the
+release workflow's SLSA checks:
+
+```bash
+npm audit signatures \
+  --prefix "$CONSUMER_DIR" \
+  --registry=https://registry.npmjs.org/ \
+  --json \
+  --include-attestations
+```
+
+The audit must identify the public npm registry, an SLSA v1 attestation, the
+exact package tarball, the protected release workflow, and the release commit.
+The `npm view` fields and `dist.integrity` value are useful cross-checks, but a
+matching registry record alone does not prove who built or signed the package.
+
+The first two historical npm releases, `0.1.0` and `0.1.1`, may omit `gitHead`
+from their registry metadata. For those versions only, the release workflow
+recovers the commit from verified SLSA provenance and then performs the normal
+integrity and provenance checks. Every later release must publish a matching
+40-character `gitHead`; a missing or mismatched value fails verification.
 
 `bundledPluginVersion` in `codex-security info --json` is useful diagnostic
 metadata, but it does not replace the bundled tree hash. A runtime or catalog
