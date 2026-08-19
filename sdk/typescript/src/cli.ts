@@ -10,7 +10,7 @@ import {
   constants,
   existsSync,
   lstatSync,
-  readdirSync,
+  opendirSync,
   realpathSync,
   type BigIntStats,
   writeSync,
@@ -18,9 +18,9 @@ import {
 import {
   lstat,
   mkdir,
+  opendir,
   open,
   readFile,
-  readdir,
   realpath,
   writeFile,
 } from "node:fs/promises";
@@ -5054,8 +5054,10 @@ function isOutsidePath(path: string): boolean {
 }
 
 async function hasPartialOutput(path: string): Promise<boolean> {
+  let directory: Awaited<ReturnType<typeof opendir>> | undefined;
   try {
-    return (await readdir(path)).length > 0;
+    directory = await opendir(path);
+    return (await directory.read()) !== null;
   } catch (error: unknown) {
     return !(
       typeof error === "object" &&
@@ -5063,12 +5065,20 @@ async function hasPartialOutput(path: string): Promise<boolean> {
       "code" in error &&
       error.code === "ENOENT"
     );
+  } finally {
+    if (directory !== undefined) {
+      try {
+        await directory.close();
+      } catch {}
+    }
   }
 }
 
 function hasPartialOutputSync(path: string): boolean {
+  let directory: ReturnType<typeof opendirSync> | undefined;
   try {
-    return readdirSync(path).length > 0;
+    directory = opendirSync(path);
+    return directory.readSync() !== null;
   } catch (error: unknown) {
     return !(
       typeof error === "object" &&
@@ -5076,6 +5086,10 @@ function hasPartialOutputSync(path: string): boolean {
       "code" in error &&
       error.code === "ENOENT"
     );
+  } finally {
+    try {
+      directory?.closeSync();
+    } catch {}
   }
 }
 
@@ -5821,7 +5835,9 @@ async function executeScan(
     const message =
       failure instanceof OutputInsideProtectedRootError
         ? errorMessage(protectedRootErrorMessage(failure))
-        : scanFailureMessage(failure, selectedAuthentication);
+        : costLimitFailure !== undefined
+          ? scanCostLimitFailureMessage(costLimitFailure, partialOutput)
+          : scanFailureMessage(failure, selectedAuthentication);
     diagnostic("scan.failed", {
       classification:
         costLimitFailure !== undefined
@@ -6129,6 +6145,16 @@ function scanFailureMessage(
     case "unknown":
       return diagnosticValue(error);
   }
+}
+
+function scanCostLimitFailureMessage(
+  failure: ScanCostLimitExceededError,
+  partialOutput: boolean,
+): string {
+  const output = partialOutput
+    ? `partial output remains at ${errorMessage(failure.scanDir)}`
+    : "no partial output was kept";
+  return `Scan stopped: estimated cost ${formatUsd(failure.cost.estimatedUsd)} exceeded the ${formatUsd(failure.maxCostUsd)} limit; ${output}.`;
 }
 
 function scanScope(arguments_: ScanArguments): string | null {
