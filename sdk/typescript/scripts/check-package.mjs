@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { brotliDecompressSync, gunzipSync } from "node:zlib";
 import { assertExpectedGitHead } from "./package-provenance.mjs";
 import { packageSmokeTimeouts } from "./package-smoke-timeouts.mjs";
+import { regularTarListingLines } from "./package-tar-listing.mjs";
 
 const PACKAGE_SMOKE_PROCESS_TIMEOUT_MS =
   packageSmokeTimeouts().processTimeoutMs;
@@ -13,7 +14,10 @@ const args = process.argv.slice(2);
 if (args[0] === "--") args.shift();
 const [
   archive,
-  contractPath = new URL("../plugin-files.json", import.meta.url),
+  contractPath = new URL(
+    "../../../plugins/codex-security/plugin-files.json",
+    import.meta.url,
+  ),
 ] = args;
 if (archive === undefined || args.length > 2) {
   throw new Error(
@@ -44,6 +48,7 @@ function tar(args, encoding = "buffer") {
 }
 
 let offset = 0;
+const archiveFiles = new Map();
 for (; offset + 512 <= archiveBytes.byteLength; ) {
   const header = archiveBytes.subarray(offset, offset + 512);
   if (header.every((byte) => byte === 0)) {
@@ -65,10 +70,29 @@ for (; offset + 512 <= archiveBytes.byteLength; ) {
     throw new Error("npm tarball contains an invalid tar entry.");
   }
   const size = Number.parseInt(sizeField || "0", 8);
-  offset += 512 + Math.ceil(size / 512) * 512;
+  const contentsStart = offset + 512;
+  const nextOffset = contentsStart + Math.ceil(size / 512) * 512;
+  if (nextOffset > archiveBytes.byteLength) {
+    throw new Error("npm tarball contains an invalid tar entry.");
+  }
+  if (header[156] === 0 || header[156] === 0x30) {
+    archiveFiles.set(
+      path,
+      archiveBytes.subarray(contentsStart, contentsStart + size),
+    );
+  }
+  offset = nextOffset;
 }
 if (archiveBytes.subarray(offset).some((byte) => byte !== 0)) {
   throw new Error("npm tarball contains trailing tar data.");
+}
+
+function archiveFile(path) {
+  const contents = archiveFiles.get(path);
+  if (contents === undefined) {
+    throw new Error("npm tarball contains an invalid tar entry: " + path + ".");
+  }
+  return contents;
 }
 
 const entries = tar(["-tzf", archive], "utf8").split(/\r?\n/u).filter(Boolean);
@@ -144,14 +168,30 @@ const distFiles = new Set(
     "auth",
     "bulk-scan-discovery",
     "cli",
+    "cloud-publish",
+    "codex-prompt",
+    "component-plan",
+    "component-scan",
     "config",
     "contract",
     "cost",
+    "cost-model",
+    "custom-validation",
+    "custom-validation-prompt",
+    "custom-publish",
+    "deep-progress",
     "errors",
+    "github",
     "index",
     "knowledge-base",
+    "linear",
     "models",
     "multiscan",
+    "patch-tui",
+    "publication",
+    "publication-events",
+    "publication-store",
+    "publish",
     "result",
     "runtime",
     "scan-activity",
@@ -159,9 +199,35 @@ const distFiles = new Set(
     "scan-dashboard",
     "scan-history-renderer",
     "scan-logs",
+    "scan-sessions",
+    "server/index",
+    "deduplication/codex-review",
+    "deduplication/checkpointed-review",
+    "deduplication/deduplication",
+    "finding-retrieval",
+    "finding-workflow",
+    "findings-client",
+    "finding-dedupe-groups",
+    "deduplication/deduplication-prompts",
+    "deduplication/deduplication-reviewer",
+    "deduplication/scan",
+    "saved-scan",
+    "server/embeddings",
+    "server/dashboard",
+    "server/dashboard-types",
+    "server/errors",
+    "server/findings-service",
+    "server/routes",
+    "server/server",
+    "server/serve",
+    "server/sqlite-store",
+    "server/storage",
+    "server/validation",
     "targets",
+    "thread-source",
     "trusted-executable",
     "version",
+    "windows-path",
     "worker-progress",
   ].flatMap((module) =>
     ["js", "js.map", "d.ts", "d.ts.map"].map(
@@ -169,6 +235,15 @@ const distFiles = new Set(
     ),
   ),
 );
+const dashboardFiles = new Set([
+  "package/dist/server/dashboard/index.html",
+  "package/dist/server/dashboard/app.js",
+  "package/dist/server/dashboard/app.css",
+  "package/dist/server/dashboard/THIRD_PARTY_NOTICES.txt",
+]);
+for (const file of dashboardFiles) {
+  if (!files.has(file)) throw new Error(`npm tarball is missing ${file}.`);
+}
 for (const file of distFiles) {
   if (!files.has(file)) throw new Error(`npm tarball is missing ${file}.`);
 }
@@ -179,9 +254,13 @@ for (const file of files) {
     ? normalized === "package" ||
       normalized === "package/bin" ||
       normalized === "package/dist" ||
+      normalized === "package/dist/server" ||
+      normalized === "package/dist/server/dashboard" ||
+      normalized === "package/dist/deduplication" ||
       pluginDirectories.has(normalized)
     : allowedRoot.has(normalized) ||
       distFiles.has(normalized) ||
+      dashboardFiles.has(normalized) ||
       pluginEntries.has(normalized);
   if (!allowed || unsafePath.test(file) || file.includes("\\")) {
     throw new Error(`npm tarball contains an unexpected file: ${file}.`);
@@ -189,12 +268,7 @@ for (const file of files) {
 }
 
 const listing = tar(["-tvzf", archive], "utf8");
-if (/^[^d-]/mu.test(listing)) {
-  throw new Error(
-    "npm tarball contains a non-regular entry (symbolic or hard link, device, or pipe).",
-  );
-}
-const listingLines = listing.split(/\r?\n/u).filter(Boolean);
+const listingLines = regularTarListingLines(listing);
 if (
   listingLines.length !== entries.length ||
   listingLines.some(
@@ -203,16 +277,18 @@ if (
 ) {
   throw new Error("npm tarball contains an invalid tar entry.");
 }
-const launcherPermissions =
-  listingLines[entries.indexOf("package/bin/codex-security.mjs")]?.split(
-    /\s/u,
-    1,
-  )[0] ?? "";
-if ([3, 6, 9].some((index) => launcherPermissions[index] !== "x")) {
-  throw new Error("npm package CLI launcher is not executable.");
+for (const [path, name] of [
+  ["package/bin/codex-security.mjs", "CLI"],
+  ["package/_bundled_plugin/scripts/launch_codex_security_mcp", "MCP"],
+]) {
+  const permissions =
+    listingLines[entries.indexOf(path)]?.split(/\s/u, 1)[0] ?? "";
+  if ([3, 6, 9].some((index) => permissions[index] !== "x")) {
+    throw new Error(`npm package ${name} launcher is not executable.`);
+  }
 }
 const packageJson = JSON.parse(
-  tar(["-xOf", archive, "package/package.json"]).toString("utf8"),
+  archiveFile("package/package.json").toString("utf8"),
 );
 if (
   packageJson.name !== "@openai/codex-security" ||
@@ -252,22 +328,16 @@ function brotliPayload(bytes, file) {
 }
 
 for (const file of compressedFiles) {
-  payloads.push(
-    brotliPayload(tar(["-xOf", archive, file]), file).toString("utf8"),
-  );
+  payloads.push(brotliPayload(archiveFile(file), file).toString("utf8"));
 }
 for (const parts of compressedParts.values()) {
   parts.sort((left, right) => left.part - right.part);
-  const bytes = Buffer.concat(
-    parts.map(({ file }) => tar(["-xOf", archive, file])),
-  );
+  const bytes = Buffer.concat(parts.map(({ file }) => archiveFile(file)));
   payloads.push(brotliPayload(bytes, parts[0].file).toString("utf8"));
 }
 for (const file of files) {
   if (/\.png$/iu.test(file)) {
-    const digest = createHash("sha256")
-      .update(tar(["-xOf", archive, file]))
-      .digest("hex");
+    const digest = createHash("sha256").update(archiveFile(file)).digest("hex");
     if (digest !== PUBLIC_LOGO_SHA256) {
       throw new Error(`npm tarball contains an unexpected PNG asset: ${file}.`);
     }

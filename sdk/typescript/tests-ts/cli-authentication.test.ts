@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import {
   mkdir,
   mkdtemp,
@@ -10,19 +11,33 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { main } from "../src/cli.js";
 import { CodexSecurityError, type ScanOptions } from "../src/index.js";
 import {
   codexSecurityCredentialAllowsAmbientImport,
   prepareCodexSecurityCredentialHome,
+  setCodexSecurityCredentialLogout,
 } from "../src/runtime.js";
 import {
   capture,
   dependencies as cliDependencies,
+  FakeSignals,
   fakePreflight,
   fakeResult,
-} from "./support/cli.js";
+} from "./cli-fixtures.js";
+
+let stateDirectory: string;
+
+beforeEach(async () => {
+  stateDirectory = await realpath(
+    await mkdtemp(join(tmpdir(), "codex-security-cli-authentication-")),
+  );
+});
+
+afterEach(async () => {
+  await rm(stateDirectory, { recursive: true, force: true });
+});
 
 function dependencies(
   options: Parameters<typeof cliDependencies>[0] = {},
@@ -30,10 +45,7 @@ function dependencies(
   return cliDependencies({
     ...options,
     environment: {
-      CODEX_SECURITY_STATE_DIR: join(
-        tmpdir(),
-        `codex-security-cli-authentication-${process.pid}`,
-      ),
+      CODEX_SECURITY_STATE_DIR: stateDirectory,
       ...options.environment,
     },
   });
@@ -53,6 +65,8 @@ describe("CLI authentication", () => {
       const stdout = capture();
       const stderr = capture();
       const deps = dependencies();
+      deps.prepareAuthenticationHome = async () =>
+        join(stateDirectory, "codex-home");
       let forwarded: readonly string[] | undefined;
       deps.createSecurity = () => {
         throw new Error("must not initialize Codex Security");
@@ -69,8 +83,6 @@ describe("CLI authentication", () => {
   });
 
   test("uses the same stable credential home for login, status, and logout", async () => {
-    const stateDirectory = join(tmpdir(), "codex-security-managed-auth-state");
-    await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
     const expectedHome = await realpath(
       await prepareCodexSecurityCredentialHome({
         CODEX_SECURITY_STATE_DIR: stateDirectory,
@@ -170,25 +182,25 @@ describe("CLI authentication", () => {
         `Effective scan authentication: API key from ${expectedSource}.`,
       );
       expect(stderr.text()).toContain(
-        "To use a ChatGPT sign-in, unset OPENAI_API_KEY and CODEX_API_KEY.",
+        "To use a ChatGPT sign-in, remove OPENAI_API_KEY and CODEX_API_KEY from the environment.",
       );
       expect(stderr.text()).not.toContain("SYNTHETIC_SECRET");
     }
   });
 
   test("explains interactive choice and how to unset every shadowing key after ChatGPT login", async () => {
-    for (const [argv, environment, source, unsetCommand] of [
+    for (const [argv, environment, source, removalGuidance] of [
       [
         ["login"],
         { OPENAI_API_KEY: "sk-proj-SYNTHETIC_SECRET_123" },
         "OPENAI_API_KEY",
-        "unset OPENAI_API_KEY",
+        "remove OPENAI_API_KEY from the environment",
       ],
       [
         ["login", "--device-auth"],
         { Codex_Api_Key: "sk-proj-SYNTHETIC_SECRET_456" },
         "CODEX_API_KEY",
-        "unset Codex_Api_Key",
+        "remove Codex_Api_Key from the environment",
       ],
       [
         ["login"],
@@ -197,7 +209,7 @@ describe("CLI authentication", () => {
           CODEX_API_KEY: "sk-proj-SYNTHETIC_SECRET_456",
         },
         "OPENAI_API_KEY",
-        "unset OPENAI_API_KEY CODEX_API_KEY",
+        "remove OPENAI_API_KEY and CODEX_API_KEY from the environment",
       ],
     ] as const) {
       const stdout = capture();
@@ -219,22 +231,23 @@ describe("CLI authentication", () => {
         `noninteractive scans will use ${source}.`,
       );
       expect(stderr.text()).toContain("--auth chatgpt");
-      expect(stderr.text()).toContain(`'${unsetCommand}'`);
+      expect(stderr.text()).toContain(removalGuidance);
+      expect(stderr.text()).not.toContain("unset ");
       expect(stderr.text()).not.toContain("SYNTHETIC_SECRET");
     }
   });
 
   test("warns when an environment API key overrides a successful access-token login", async () => {
-    for (const [environment, source, unsetCommand] of [
+    for (const [environment, source, removalGuidance] of [
       [
         { OPENAI_API_KEY: "sk-proj-SYNTHETIC_SECRET_123" },
         "OPENAI_API_KEY",
-        "unset OPENAI_API_KEY",
+        "remove OPENAI_API_KEY from the environment",
       ],
       [
         { Codex_Api_Key: "sk-proj-SYNTHETIC_SECRET_456" },
         "CODEX_API_KEY",
-        "unset Codex_Api_Key",
+        "remove Codex_Api_Key from the environment",
       ],
       [
         {
@@ -242,7 +255,7 @@ describe("CLI authentication", () => {
           CODEX_API_KEY: "sk-proj-SYNTHETIC_SECRET_456",
         },
         "OPENAI_API_KEY",
-        "unset OPENAI_API_KEY CODEX_API_KEY",
+        "remove OPENAI_API_KEY and CODEX_API_KEY from the environment",
       ],
     ] as const) {
       const stdout = capture();
@@ -261,9 +274,9 @@ describe("CLI authentication", () => {
         `Access-token login succeeded, but noninteractive scans will use ${source}.`,
       );
       expect(stderr.text()).toContain(
-        "To use your stored credentials, pass '--auth chatgpt' or run ",
+        `To use your stored credentials, pass '--auth chatgpt' or ${removalGuidance}.`,
       );
-      expect(stderr.text()).toContain(`'${unsetCommand}'`);
+      expect(stderr.text()).not.toContain("unset ");
       expect(stderr.text()).not.toContain("ChatGPT login succeeded");
       expect(stderr.text()).not.toContain("SYNTHETIC_SECRET");
     }
@@ -494,6 +507,47 @@ describe("CLI authentication", () => {
         "Both a ChatGPT sign-in and an API key from OPENAI_API_KEY are available.",
       );
       expect(stderr.text()).not.toContain("SYNTHETIC_SECRET");
+    }
+  });
+
+  test("cancels sign-in discovery and authentication prompts before starting a scan", async () => {
+    for (const stage of ["status", "prompt"] as const) {
+      const signals = new FakeSignals();
+      const signalName = stage === "status" ? "SIGTERM" : "SIGINT";
+      let observedSignal: AbortSignal | undefined;
+      let initialized = false;
+      const deps = dependencies({
+        signals,
+        environment: { OPENAI_API_KEY: "synthetic-private-key" },
+      });
+      deps.createSecurity = () => {
+        initialized = true;
+        throw new Error("must not initialize a cancelled scan");
+      };
+      const interrupt = <Value>(signal?: AbortSignal): Promise<Value> => {
+        observedSignal = signal;
+        signals.emit(signalName);
+        return new Promise(() => {});
+      };
+      deps.hasStoredChatGPTSignIn = (signal) =>
+        stage === "status" ? interrupt<boolean>(signal) : Promise.resolve(true);
+      deps.scanAuthenticationPrompt = {
+        isInteractive: () => true,
+        select: <Value extends string>(
+          _message: string,
+          _options: readonly { label: string; value: Value }[],
+          _presentation?: { header?: string },
+          signal?: AbortSignal,
+        ) => interrupt<Value>(signal),
+      };
+
+      expect(
+        await main(["scan"], capture().stream, capture(true).stream, deps),
+      ).toBe(signalName === "SIGTERM" ? 143 : 130);
+      expect(observedSignal?.aborted).toBe(true);
+      expect(initialized).toBe(false);
+      expect(signals.listeners.get("SIGINT")?.size).toBe(0);
+      expect(signals.listeners.get("SIGTERM")?.size).toBe(0);
     }
   });
 
@@ -827,9 +881,79 @@ describe("CLI authentication", () => {
         expect(stderr.text()).toContain(expected);
         expect(stderr.text()).toContain(source);
         expect(stderr.text()).toContain("--auth chatgpt");
+        expect(stderr.text()).not.toContain("ChatGPT sign-in was not used");
         expect(stderr.text()).not.toContain("SYNTHETIC_SECRET");
         expect(stderr.text()).not.toContain("org-private");
       }
+    }
+  });
+
+  test("replaces permanent stored sign-in refresh details with recovery steps", async () => {
+    for (const auth of ["chatgpt", "api-key"] as const) {
+      for (const detail of [
+        "Your access token could not be refreshed.",
+        "Your access token could not be refreshed because your refresh token has expired.",
+        "Your access token could not be refreshed because your refresh token was already used.",
+        "Your access token could not be refreshed because your refresh token was revoked.",
+      ]) {
+        const stdout = capture();
+        const stderr = capture(false);
+        const deps = dependencies({
+          environment: { OPENAI_API_KEY: "sk-proj-SYNTHETIC_SECRET_123" },
+          onRun: () => {
+            throw new CodexSecurityError(
+              `Codex Exec exited with code 1: Error: ${detail} Please log out and sign in again. PRIVATE_UPSTREAM_DETAIL`,
+            );
+          },
+        });
+
+        expect(
+          await main(
+            ["scan", ".", "--auth", auth, "--json"],
+            stdout.stream,
+            stderr.stream,
+            deps,
+          ),
+        ).toBe(2);
+        expect(stdout.text()).toBe("");
+        expect(stderr.text()).toContain("workspace-managed policies");
+        expect(stderr.text()).toContain(
+          "API key is selected for model authentication",
+        );
+        expect(stderr.text()).toContain(
+          "npx @openai/codex-security login status",
+        );
+        expect(stderr.text()).toContain(
+          "npx @openai/codex-security logout', then 'npx @openai/codex-security login",
+        );
+        expect(stderr.text()).not.toContain("provide a valid API key");
+        expect(stderr.text()).not.toContain("PRIVATE_UPSTREAM_DETAIL");
+      }
+    }
+  });
+
+  test("leaves other sign-in recovery messages unchanged", async () => {
+    for (const message of [
+      "Your access token could not be refreshed because you have since logged out or signed in to another account. Please sign in again.",
+      "Your authentication session could not be refreshed automatically. Please log out and sign in again.",
+    ]) {
+      const stdout = capture();
+      const stderr = capture(false);
+      const deps = dependencies({
+        onRun: () => {
+          throw new CodexSecurityError(
+            `Codex Exec exited with code 1: ${message} PRIVATE_UPSTREAM_DETAIL`,
+          );
+        },
+      });
+
+      expect(
+        await main(["scan", "--json"], stdout.stream, stderr.stream, deps),
+      ).toBe(2);
+      expect(stdout.text()).toBe("");
+      expect(stderr.text()).toContain(`${message}\n`);
+      expect(stderr.text()).not.toContain("PRIVATE_UPSTREAM_DETAIL");
+      expect(stderr.text()).not.toContain("npx @openai/codex-security logout");
     }
   });
 
@@ -944,5 +1068,79 @@ describe("CLI authentication", () => {
     ).toBe(0);
     expect(JSON.parse(stdout.text())).toMatchObject({ authentication });
     expect(`${stdout.text()}${stderr.text()}`).not.toContain("synthetic");
+  });
+
+  test("recognizes existing ambient Codex authentication on a fresh state directory during login status", async () => {
+    const root = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-cli-ambient-auth-")),
+    );
+    try {
+      const ambientHome = join(root, "ambient-codex");
+      await mkdir(ambientHome, { mode: 0o700 });
+      await writeFile(
+        join(ambientHome, "auth.json"),
+        '{"auth_mode":"chatgpt"}\n',
+      );
+
+      const stdout = capture();
+      const stderr = capture();
+      let forwardedHome: string | undefined;
+      const deps = dependencies({
+        environment: {
+          CODEX_HOME: ambientHome,
+          CODEX_SECURITY_STATE_DIR: stateDirectory,
+        },
+      });
+      deps.runCodex = async (_args, _output, authEnvironment) => {
+        forwardedHome = authEnvironment?.["CODEX_HOME"];
+        return 0;
+      };
+
+      expect(
+        await main(["login", "status"], stdout.stream, stderr.stream, deps),
+      ).toBe(0);
+      expect(forwardedHome).toBe(join(stateDirectory, "codex-home"));
+      expect(existsSync(join(stateDirectory, "codex-home", "auth.json"))).toBe(
+        true,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not import ambient Codex authentication during login status after explicit logout", async () => {
+    const root = await realpath(
+      await mkdtemp(join(tmpdir(), "codex-security-cli-ambient-logout-")),
+    );
+    try {
+      const ambientHome = join(root, "ambient-codex");
+      await mkdir(ambientHome, { mode: 0o700 });
+      await writeFile(
+        join(ambientHome, "auth.json"),
+        '{"auth_mode":"chatgpt"}\n',
+      );
+
+      const credentialHome = await prepareCodexSecurityCredentialHome({
+        CODEX_SECURITY_STATE_DIR: stateDirectory,
+      });
+      await setCodexSecurityCredentialLogout(credentialHome, true);
+
+      const stdout = capture();
+      const stderr = capture();
+      const deps = dependencies({
+        environment: {
+          CODEX_HOME: ambientHome,
+          CODEX_SECURITY_STATE_DIR: stateDirectory,
+        },
+      });
+      deps.runCodex = async () => 0;
+
+      expect(
+        await main(["login", "status"], stdout.stream, stderr.stream, deps),
+      ).toBe(0);
+      expect(existsSync(join(credentialHome, "auth.json"))).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

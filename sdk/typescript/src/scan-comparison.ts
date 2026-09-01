@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import {
   Codex,
+  type CodexOptions,
   type ModelReasoningEffort,
   type ThreadOptions,
   type TurnOptions,
@@ -10,21 +11,40 @@ import {
 import { z } from "incur";
 import type { CodexSecuritySurface } from "./api.js";
 import { accountStatus } from "./auth.js";
+import {
+  mergedCodexConfig,
+  scanModelConfiguration,
+  type CodexSecurityConfig,
+  type JsonObject,
+} from "./config.js";
 import { CodexSecurityError } from "./errors.js";
 import {
   codexSecurityCredentialHome,
+  executablePathForSpawn,
+  expandHome,
   prepareCodexSecurityCredentialHome,
   resolveCodexCommand,
+  runCodexCommand,
+  type CodexCommand,
 } from "./runtime.js";
+import {
+  CODEX_SECURITY_THREAD_SOURCES,
+  type CodexSecurityThreadSource,
+} from "./thread-source.js";
 
 type Finding = { occurrenceId: string } & Record<string, unknown>;
+type ReadOnlyCodexThreadSource = Extract<
+  CodexSecurityThreadSource,
+  | typeof CODEX_SECURITY_THREAD_SOURCES.scan
+  | typeof CODEX_SECURITY_THREAD_SOURCES.scanComparison
+>;
 
 export interface ScanComparisonInput {
   before: readonly Finding[];
   after: readonly Finding[];
 }
 
-interface ComparisonCodex {
+interface ReadOnlyCodex {
   startThread(options: ThreadOptions): {
     run(
       input: string,
@@ -33,14 +53,18 @@ interface ComparisonCodex {
   };
 }
 
-export interface ScanComparisonOptions {
-  allowHistoricalUncertainty?: boolean;
-  codex?: ComparisonCodex;
+export interface ReadOnlyCodexOptions {
+  config?: CodexSecurityConfig;
+  codex?: ReadOnlyCodex;
   environment?: NodeJS.ProcessEnv;
   model?: string;
   reasoningEffort?: ModelReasoningEffort;
   signal?: AbortSignal;
   workingDirectory?: string;
+}
+
+export interface ScanComparisonOptions extends ReadOnlyCodexOptions {
+  allowHistoricalUncertainty?: boolean;
 }
 
 interface CompletedScanMatchingOptions
@@ -50,7 +74,10 @@ interface CompletedScanMatchingOptions
   previousFindings: readonly Record<string, unknown>[];
   falsePositives: readonly Record<string, unknown>[];
   findings: readonly Finding[];
-  workbench(args: readonly string[]): Promise<Record<string, unknown>>;
+  workbench(
+    args: readonly string[],
+    input?: string,
+  ): Promise<Record<string, unknown>>;
   matchFindings?: typeof matchScanFindings;
 }
 
@@ -84,6 +111,8 @@ const comparisonSchema = z
 
 export type ScanComparisonResult = z.infer<typeof comparisonSchema>;
 
+const CODEX_MAX_INPUT_CHARACTERS = 1024 * 1024;
+
 export async function matchScanFindings(
   input: ScanComparisonInput,
   options: ScanComparisonOptions = {},
@@ -94,40 +123,186 @@ export async function matchScanFindings(
 export async function matchScanFindingsInternal(
   input: ScanComparisonInput,
   options: ScanComparisonOptions = {},
-  runtimeOptions: { surface: CodexSecuritySurface },
+  runtimeOptions: { surface: CodexSecuritySurface; allowBatching?: boolean },
 ): Promise<ScanComparisonResult> {
+  const comparisons: ScanComparisonResult[] = [];
+  const allowHistoricalUncertainty =
+    options.allowHistoricalUncertainty ?? false;
+  const outputSchema = z.toJSONSchema(comparisonSchema, {
+    target: "openapi-3.0",
+  });
+  for (const batch of comparisonBatches(input, runtimeOptions.allowBatching)) {
+    options.signal?.throwIfAborted();
+    const finalResponse = await runReadOnlyCodex(
+      batch.prompt,
+      outputSchema,
+      options,
+      {
+        ...runtimeOptions,
+        threadSource: CODEX_SECURITY_THREAD_SOURCES.scanComparison,
+      },
+    );
+    let response: unknown;
+    try {
+      response = JSON.parse(finalResponse);
+    } catch (error) {
+      throw new CodexSecurityError("Scan comparison returned invalid JSON.", {
+        cause: error,
+      });
+    }
+    comparisons.push(
+      validateComparison(batch.input, response, allowHistoricalUncertainty),
+    );
+  }
+  return combineComparisons(comparisons, allowHistoricalUncertainty);
+}
+
+function* comparisonBatches(
+  input: ScanComparisonInput,
+  allowBatching = true,
+): Generator<{ input: ScanComparisonInput; prompt: string }> {
+  const prompt = comparisonPrompt(input);
+  if (allowBatching && prompt.length > CODEX_MAX_INPUT_CHARACTERS / 2) {
+    // Splitting one side at a time covers every before/after pair exactly once.
+    const side =
+      input.before.length > 1 &&
+      (input.after.length < 2 ||
+        JSON.stringify(input.before).length >=
+          JSON.stringify(input.after).length)
+        ? "before"
+        : "after";
+    const findings = input[side];
+    if (findings.length > 1) {
+      const middle = Math.ceil(findings.length / 2);
+      yield* comparisonBatches({ ...input, [side]: findings.slice(0, middle) });
+      yield* comparisonBatches({ ...input, [side]: findings.slice(middle) });
+      return;
+    }
+  }
+  if (prompt.length > CODEX_MAX_INPUT_CHARACTERS) {
+    throw new CodexSecurityError(
+      `Finding comparison exceeds Codex's ${CODEX_MAX_INPUT_CHARACTERS}-character input limit.`,
+    );
+  }
+  yield { input, prompt };
+}
+
+function combineComparisons(
+  comparisons: ScanComparisonResult[],
+  allowHistoricalUncertainty: boolean,
+): ScanComparisonResult {
+  let matches: ScanComparisonResult["matches"] = [];
+  for (const match of comparisons.flatMap(({ matches }) => matches)) {
+    const before = new Set(match.beforeOccurrenceIds);
+    const after = new Set(match.afterOccurrenceIds);
+    const overlapping = matches.filter(
+      (group) =>
+        group.beforeOccurrenceIds.some((id) => before.has(id)) ||
+        group.afterOccurrenceIds.some((id) => after.has(id)),
+    );
+    if (overlapping.length === 0) {
+      matches.push(match);
+      continue;
+    }
+    const joined = [...overlapping, match];
+    const merged = {
+      beforeOccurrenceIds: [
+        ...new Set(joined.flatMap((group) => group.beforeOccurrenceIds)),
+      ],
+      afterOccurrenceIds: [
+        ...new Set(joined.flatMap((group) => group.afterOccurrenceIds)),
+      ],
+      confidence: "high" as const,
+      reason: [...new Set(joined.map((group) => group.reason))].join("\n"),
+    };
+    matches.splice(matches.indexOf(overlapping[0]!), 1, merged);
+    matches = matches.filter((group) => !overlapping.includes(group));
+  }
+  const matchedBefore = new Set(
+    matches.flatMap((group) => group.beforeOccurrenceIds),
+  );
+  const matchedAfter = new Set(
+    matches.flatMap((group) => group.afterOccurrenceIds),
+  );
+  const uncertain = comparisons
+    .flatMap(({ uncertain }) => uncertain)
+    .filter(
+      ({ beforeOccurrenceId, afterOccurrenceId }) =>
+        !matchedBefore.has(beforeOccurrenceId) &&
+        (allowHistoricalUncertainty || !matchedAfter.has(afterOccurrenceId)),
+    );
+  return { matches, uncertain };
+}
+
+export async function runReadOnlyCodex(
+  prompt: string,
+  outputSchema: unknown,
+  options: ReadOnlyCodexOptions,
+  runtimeOptions: {
+    surface: CodexSecuritySurface;
+    threadSource: ReadOnlyCodexThreadSource;
+  },
+): Promise<string> {
+  const config =
+    options.config === undefined
+      ? undefined
+      : await mergedCodexConfig(options.config);
+  const configuredModel =
+    config === undefined ? undefined : scanModelConfiguration(config);
+  const model = options.model ?? configuredModel?.model;
+  const reasoningEffort =
+    options.reasoningEffort ??
+    (configuredModel?.reasoningEffort as ModelReasoningEffort | undefined) ??
+    "medium";
+  const environment =
+    options.codex === undefined
+      ? await comparisonEnvironment(
+          options.environment,
+          accountStatus,
+          options.signal,
+        )
+      : undefined;
+  const command =
+    environment === undefined ? undefined : resolveCodexCommand(environment);
   const codex =
     options.codex ??
     new Codex({
-      env: await comparisonEnvironment(
-        options.environment,
-        accountStatus,
-        options.signal,
-      ),
+      codexPathOverride: executablePathForSpawn(command!.command),
+      env: environment,
       config: {
+        ...config,
+        mcp_servers: await disabledMcpServers(
+          command!,
+          config,
+          environment!,
+          options,
+        ),
         allow_login_shell: false,
         responses_api_metadata: {
           codex_security_surface: runtimeOptions.surface,
         },
-        "features.apps": false,
-        "features.code_mode": false,
-        "features.code_mode_only": false,
-        "features.js_repl": false,
-        "features.multi_agent": false,
-        "features.multi_agent_v2": false,
-        "features.plugins": false,
-        "features.shell_tool": false,
-        "features.unified_exec": false,
+        features: {
+          apps: false,
+          code_mode: false,
+          code_mode_only: false,
+          js_repl: false,
+          multi_agent: false,
+          multi_agent_v2: false,
+          plugins: false,
+          shell_tool: false,
+          unified_exec: false,
+        },
         shell_environment_policy: {
           inherit: "core",
           ignore_default_excludes: false,
           exclude: ["CODEX_HOME", "*KEY*", "*SECRET*", "*TOKEN*"],
         },
-      },
+      } as NonNullable<CodexOptions["config"]>,
     });
   const thread = codex.startThread({
-    ...(options.model === undefined ? {} : { model: options.model }),
-    modelReasoningEffort: options.reasoningEffort ?? "medium",
+    threadSource: runtimeOptions.threadSource,
+    ...(model === undefined ? {} : { model }),
+    modelReasoningEffort: reasoningEffort,
     sandboxMode: "read-only",
     approvalPolicy: "never",
     networkAccessEnabled: false,
@@ -135,22 +310,49 @@ export async function matchScanFindingsInternal(
     workingDirectory: options.workingDirectory ?? process.cwd(),
     skipGitRepoCheck: true,
   });
-  const turn = await thread.run(comparisonPrompt(input), {
-    outputSchema: z.toJSONSchema(comparisonSchema, { target: "openapi-3.0" }),
+  const turn = await thread.run(prompt, {
+    outputSchema,
     ...(options.signal === undefined ? {} : { signal: options.signal }),
   });
-  let response: unknown;
-  try {
-    response = JSON.parse(turn.finalResponse);
-  } catch (error) {
-    throw new CodexSecurityError("Scan comparison returned invalid JSON.", {
-      cause: error,
-    });
-  }
-  return validateComparison(
-    input,
-    response,
-    options.allowHistoricalUncertainty ?? false,
+  return turn.finalResponse;
+}
+
+export async function disabledMcpServers(
+  command: CodexCommand,
+  config: JsonObject | undefined,
+  environment: Record<string, string>,
+  options: ReadOnlyCodexOptions,
+): Promise<JsonObject> {
+  const { success, stdout, stderr } = await runCodexCommand(
+    command,
+    [
+      "-C",
+      options.workingDirectory ?? process.cwd(),
+      "-c",
+      "features.plugins=false",
+      "mcp",
+      "list",
+      "--json",
+    ],
+    environment,
+    undefined,
+    options.signal,
+  );
+  if (!success)
+    throw new CodexSecurityError(
+      `Could not read MCP configuration for a read-only helper: ${stderr.trim()}`,
+    );
+  const inherited = JSON.parse(stdout) as { name: string }[];
+  const configured = (config?.["mcp_servers"] ?? {}) as JsonObject;
+  const names = new Set([
+    ...Object.keys(configured),
+    ...inherited.map(({ name }) => name),
+  ]);
+  return Object.fromEntries(
+    [...names].map((name) => [
+      name,
+      { ...(configured[name] as JsonObject), enabled: false },
+    ]),
   );
 }
 
@@ -258,15 +460,17 @@ export async function matchCompletedScan(
           !matchedAfter.has(afterOccurrenceId),
       ) ?? [];
     if (semanticComparison === undefined && scanMatches.length === 0) continue;
-    await options.workbench([
-      "save-scan-comparison",
-      "--before-scan-id",
-      scanId,
-      "--after-scan-id",
-      options.scanId,
-      "--matches-json",
+    await options.workbench(
+      [
+        "save-scan-comparison",
+        "--before-scan-id",
+        scanId,
+        "--after-scan-id",
+        options.scanId,
+        "--matches-json-stdin",
+      ],
       JSON.stringify({ matches: scanMatches, uncertain: scanUncertain }),
-    ]);
+    );
   }
 }
 
@@ -287,6 +491,7 @@ export async function comparisonEnvironment(
   source: NodeJS.ProcessEnv = process.env,
   nativeAccountStatus: typeof accountStatus = accountStatus,
   signal?: AbortSignal,
+  prepareCredentialHome: typeof prepareCodexSecurityCredentialHome = prepareCodexSecurityCredentialHome,
 ): Promise<Record<string, string>> {
   signal?.throwIfAborted();
   const environment = Object.fromEntries(
@@ -294,7 +499,9 @@ export async function comparisonEnvironment(
       (entry): entry is [string, string] => entry[1] !== undefined,
     ),
   );
-  if (environment["CODEX_SECURITY_SCAN_ID"] !== undefined) return environment;
+  if (environmentEntry(environment, "CODEX_SECURITY_SCAN_ID") !== undefined) {
+    return environment;
+  }
   if (
     Object.entries(environment).some(
       ([name, value]) =>
@@ -306,32 +513,29 @@ export async function comparisonEnvironment(
   }
   const credentialHome = codexSecurityCredentialHome(source);
   if (existsSync(credentialHome)) {
-    const canonicalCredentialHome =
-      await prepareCodexSecurityCredentialHome(source);
+    const canonicalCredentialHome = await prepareCredentialHome(source);
     signal?.throwIfAborted();
-    const storedEnvironment: Record<string, string> = {
-      ...environment,
-      CODEX_HOME: canonicalCredentialHome,
-    };
+    const storedEnvironment: Record<string, string> = { ...environment };
     for (const key of Object.keys(storedEnvironment)) {
-      if (["OPENAI_API_KEY", "CODEX_API_KEY"].includes(key.toUpperCase())) {
+      if (
+        ["CODEX_HOME", "OPENAI_API_KEY", "CODEX_API_KEY"].includes(
+          key.toUpperCase(),
+        )
+      ) {
         delete storedEnvironment[key];
       }
     }
+    storedEnvironment["CODEX_HOME"] = canonicalCredentialHome;
     const status = await nativeAccountStatus(
-      resolveCodexCommand(),
+      resolveCodexCommand(source),
       storedEnvironment,
       signal,
     );
     if (status.authenticated) return storedEnvironment;
   }
-  const configuredHome = environment["CODEX_HOME"]?.trim();
+  const configuredHome = environmentEntry(environment, "CODEX_HOME")?.trim();
   const codexHome = configuredHome
-    ? configuredHome === "~"
-      ? homedir()
-      : configuredHome.startsWith("~/")
-        ? join(homedir(), configuredHome.slice(2))
-        : configuredHome
+    ? expandHome(configuredHome, environment)
     : join(homedir(), ".codex");
   if (existsSync(join(codexHome, "auth.json"))) {
     for (const key of Object.keys(environment)) {
@@ -341,6 +545,18 @@ export async function comparisonEnvironment(
     }
   }
   return environment;
+}
+
+export function environmentEntry(
+  environment: Record<string, string>,
+  requested: string,
+): string | undefined {
+  const exact = environment[requested];
+  if (exact !== undefined || process.platform !== "win32") return exact;
+  const upper = requested.toUpperCase();
+  return Object.entries(environment).find(
+    ([name]) => name.toUpperCase() === upper,
+  )?.[1];
 }
 
 function validateComparison(
