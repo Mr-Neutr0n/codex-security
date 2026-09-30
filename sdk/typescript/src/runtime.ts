@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   constants,
+  createWriteStream,
   existsSync,
   readdirSync,
   type BigIntStats,
@@ -43,9 +44,10 @@ import {
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { pipeline } from "node:stream/promises";
 import { crc32 } from "node:zlib";
 import { setTimeout as delay } from "node:timers/promises";
-import extractZip from "extract-zip";
+import { openPromise as openZip } from "yauzl";
 import { parse } from "smol-toml";
 import {
   CodexSecurityError,
@@ -55,10 +57,14 @@ import {
   PluginBootstrapError,
   PluginPythonUnavailableError,
   type ProtectedScanPathKind,
+  SandboxUnavailableError,
   errorMessage,
 } from "./errors.js";
 import type { JsonObject } from "./config.js";
-import { resolveTrustedExecutable } from "./trusted-executable.js";
+import {
+  resolveTrustedExecutable,
+  type InspectedExecutable,
+} from "./trusted-executable.js";
 import {
   isWindowsUnsafePathComponent,
   windowsUnsafePathComponent,
@@ -82,6 +88,7 @@ const CREDENTIAL_LOCK_POLL_MILLISECONDS = 25;
 const INCOMPLETE_CREDENTIAL_LOCK_MILLISECONDS = 30_000;
 const MAX_PROCESS_ID = 2_147_483_647;
 const MAX_WINDOWS_CREDENTIAL_ACL_STDERR = 64 * 1024;
+const SANDBOX_PROBE_TIMEOUT_MILLISECONDS = 10_000;
 const PLUGIN_HELPER_SECRET_ENVIRONMENT_VARIABLES = new Set([
   "OPENAI_API_KEY",
   "CODEX_API_KEY",
@@ -337,6 +344,33 @@ export async function requirePrivateCredentialHome(
     secureWindowsHome?: (path: string) => Promise<void>;
   } = {},
 ): Promise<void> {
+  await requirePrivateDirectory(metadata, path, "credential home", options);
+}
+
+export async function requirePrivatePolicyOutputDirectory(
+  path: string,
+  options: {
+    platform?: NodeJS.Platform;
+    secureWindowsHome?: (path: string) => Promise<void>;
+  } = {},
+): Promise<void> {
+  await requirePrivateDirectory(
+    await lstat(path),
+    path,
+    "policy output directory",
+    options,
+  );
+}
+
+async function requirePrivateDirectory(
+  metadata: Pick<Stats, "mode" | "uid">,
+  path: string,
+  description: string,
+  options: {
+    platform?: NodeJS.Platform;
+    secureWindowsHome?: (path: string) => Promise<void>;
+  },
+): Promise<void> {
   if ((options.platform ?? process.platform) !== "win32") {
     requirePrivateOutputDirectory(metadata, path);
     return;
@@ -347,7 +381,7 @@ export async function requirePrivateCredentialHome(
   } catch (error) {
     const detail = windowsCredentialAclFailure(error);
     throw new OutputDirectoryError(
-      `Unable to create a private Windows credential home: ${path}${detail}`,
+      `Unable to create a private Windows ${description}: ${path}${detail}`,
       { cause: error },
     );
   }
@@ -1511,7 +1545,7 @@ export function requireOutputOutsideRepositories(
 
 export async function preparePersistentOutputRoot(
   stateDirectory: string,
-  category: "scans" | "policies" | "validations",
+  category: "scans" | "policies" | "validations" | "imports",
   repositoryName: string,
 ): Promise<string> {
   requireModelSafeOutputDir(stateDirectory);
@@ -1522,7 +1556,7 @@ export async function preparePersistentOutputRoot(
     await mkdir(root, { recursive: true, mode: 0o700 });
     if (!(await lstat(root)).isDirectory()) {
       throw new OutputDirectoryError(
-        `Persistent ${category === "scans" ? "scan" : category === "policies" ? "policy" : "validation"} output must use real directories: ${root}`,
+        `Persistent ${category === "scans" ? "scan" : category === "policies" ? "policy" : category === "imports" ? "import" : "validation"} output must use real directories: ${root}`,
       );
     }
   }
@@ -2145,17 +2179,16 @@ export async function extractPluginZip(
     let expandedSize = 0;
     const paths = new Set<string>();
     const checksums: Array<{ path: string; checksum: number }> = [];
-    await extractZip(archivePath, {
-      dir: staging,
-      defaultDirMode: 0o700,
-      defaultFileMode: 0o600,
-      onEntry(entry, archive) {
+    const zip = await openZip(archivePath, { strictFileNames: true });
+    try {
+      for await (const entry of zip.eachEntry()) {
         throwIfSignalAborted(signal);
-        if (archive.entryCount > MAX_ZIP_ENTRIES) {
+        if (zip.entryCount > MAX_ZIP_ENTRIES) {
           throw new PluginBootstrapError(
-            `Plugin ZIP contains too many entries: ${archive.entryCount}.`,
+            `Plugin ZIP contains too many entries: ${zip.entryCount}.`,
           );
         }
+        if (entry.fileName.startsWith("__MACOSX/")) continue;
         const path = safeArchivePath(entry.fileName);
         const collisionKey = path.toLowerCase();
         if (paths.has(collisionKey)) {
@@ -2186,11 +2219,25 @@ export async function extractPluginZip(
           mode === 0o040000 ||
           (entry.versionMadeBy >>> 8 === 0 &&
             entry.externalFileAttributes === 16);
-        if (!directory) {
-          checksums.push({ path, checksum: entry.crc32 >>> 0 });
-        }
-      },
-    });
+        const output = join(staging, ...path.split("/"));
+        const entryMode = (entry.externalFileAttributes >>> 16) & 0xffff;
+        const permissions = (entryMode || (directory ? 0o700 : 0o600)) & 0o777;
+        await mkdir(directory ? output : dirname(output), {
+          recursive: true,
+          ...(directory ? { mode: permissions } : {}),
+        });
+        if (directory) continue;
+        const stream = await zip.openReadStreamPromise(entry);
+        await pipeline(
+          stream,
+          createWriteStream(output, { mode: permissions, flags: "wx" }),
+          { signal },
+        );
+        checksums.push({ path, checksum: entry.crc32 >>> 0 });
+      }
+    } finally {
+      zip.close();
+    }
     for (const { path, checksum } of checksums) {
       throwIfSignalAborted(signal);
       const bytes = await readFile(join(staging, ...path.split("/")));
@@ -2641,6 +2688,23 @@ export function pluginExecutionEnvironment(
   };
 }
 
+export function environmentWithGit(
+  environment: ProcessEnvironment,
+  git?: InspectedExecutable,
+): ProcessEnvironment {
+  if (git === undefined) return environment;
+  const result = { ...environment };
+  for (const name of Object.keys(result)) {
+    const normalized = name.toUpperCase();
+    if (normalized === "CODEX_SECURITY_GIT" || normalized === "PATH") {
+      delete result[name];
+    }
+  }
+  result["CODEX_SECURITY_GIT"] = git.executable ?? "";
+  result["PATH"] = git.environment["PATH"] ?? "";
+  return result;
+}
+
 export function pythonUtf8Environment(
   environment: ProcessEnvironment,
 ): ProcessEnvironment {
@@ -2713,6 +2777,39 @@ export async function runCodexCommand(
   });
   child.stdin.end(input);
   return await completion;
+}
+
+export async function probeCodexSandbox(
+  command: CodexCommand,
+  environment: ProcessEnvironment,
+  signal?: AbortSignal,
+): Promise<void> {
+  // This preflight covers the Unix sandbox backends.
+  if (process.platform === "win32") return;
+  // Reuse the resolved Codex executable instead of looking up a probe on PATH.
+  const args = ["sandbox", "--", command.command, "--version"];
+  const timeout = AbortSignal.timeout(SANDBOX_PROBE_TIMEOUT_MILLISECONDS);
+  let detail: string;
+  try {
+    const result = await runCodexCommand(
+      command,
+      args,
+      environment,
+      undefined,
+      signal === undefined ? timeout : AbortSignal.any([signal, timeout]),
+    );
+    if (result.success) return;
+    detail =
+      result.stderr.trim() ||
+      result.stdout.trim() ||
+      `Codex exited with status ${result.exitCode}.`;
+  } catch (error) {
+    signal?.throwIfAborted();
+    detail = processErrorDetail(error);
+  }
+  throw new SandboxUnavailableError(
+    `Codex could not run a command in its sandbox; reproduce with '${command.command} ${args.join(" ")}'. On Linux this usually means unprivileged user namespaces are restricted (kernel.apparmor_restrict_unprivileged_userns=1 on Ubuntu 24.04 and later), which Bubblewrap needs; inside the container image, use the AppArmor profile and Compose override from the SDK README. Codex reported: ${detail}`,
+  );
 }
 
 async function runPluginCommand(
@@ -2943,10 +3040,10 @@ export function expandHome(
 ): string {
   const home =
     (process.platform === "win32"
-      ? environmentValue(environment, "USERPROFILE") ??
-        environmentValue(environment, "HOME")
-      : environmentValue(environment, "HOME") ??
-        environmentValue(environment, "USERPROFILE")) ?? homedir();
+      ? (environmentValue(environment, "USERPROFILE") ??
+        environmentValue(environment, "HOME"))
+      : (environmentValue(environment, "HOME") ??
+        environmentValue(environment, "USERPROFILE"))) ?? homedir();
   if (value === "~") return home;
   if (value.startsWith("~/")) return join(home, value.slice(2));
   if (value.startsWith("~\\")) {
