@@ -13,26 +13,19 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { build } from "esbuild";
+import { importSource } from "./import-module.mjs";
 
 const execFile = promisify(nodeExecFile);
 const temporaryRoots = [];
-const bundle = await build({
-  bundle: true,
-  entryPoints: [
-    new URL("../src/artifact-inventory.ts", import.meta.url).pathname,
-  ],
-  format: "esm",
-  platform: "node",
-  write: false,
-});
-const inventory = await import(
-  `data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].contents).toString("base64")}`
+
+const inventory = await importSource(
+  new URL("../src/artifact-inventory.ts", import.meta.url).pathname,
 );
 
 try {
   await testSchemasAreBoundAndExact();
   await testPrepareUsesTheExistingStandardGenerator();
+  await testPrepareListsIgnoredTrackedFilesOnce();
   await testPrepareExcludesGitMetadata();
   await testPrepareUsesOnlyAuthoritativeDiffChanges();
   await testPrepareIncludesStagedAndUnstagedChanges();
@@ -145,6 +138,39 @@ async function testPrepareUsesTheExistingStandardGenerator() {
   assert.deepEqual(
     [...first.items, ...second.items].map((item) => item.path),
     expected.split("\n").filter(Boolean),
+  );
+}
+
+async function testPrepareListsIgnoredTrackedFilesOnce() {
+  const fixture = await createFixture("ignored tracked files");
+  await initializeRepository(fixture.repoRoot);
+  await writeRepositoryFile(fixture.repoRoot, ".gitignore", "generated/\n");
+  for (const name of ["a.ts", "b.ts"]) {
+    await writeRepositoryFile(
+      fixture.repoRoot,
+      `generated/${name}`,
+      "export const value = 1;\n",
+    );
+  }
+  await runGit(fixture.repoRoot, "add", "--force", "--", "generated");
+  const context = { ...fixture.scan, scope: "generated" };
+
+  assert.deepEqual(await inventory.prepareCodexSecurityReviewItems(context), {
+    reviewItemsTotal: 2,
+  });
+  const first = await inventory.listCodexSecurityReviewItems(context, {
+    limit: 1,
+  });
+  assert.deepEqual(first, {
+    items: [{ path: "generated/a.ts" }],
+    nextCursor: "1",
+  });
+  assert.deepEqual(
+    await inventory.listCodexSecurityReviewItems(context, {
+      cursor: first.nextCursor,
+      limit: 1,
+    }),
+    { items: [{ path: "generated/b.ts" }] },
   );
 }
 
