@@ -2466,6 +2466,7 @@ export class CodexSecurity {
           ]);
         } catch {}
       }
+      headDriftMonitor?.stop();
       if (runPostScan !== null && !signal.aborted) {
         try {
           for await (const event of (await runPostScan()).events) {
