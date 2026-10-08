@@ -3131,6 +3131,65 @@ describe("CodexSecurity orchestration", () => {
     },
   );
 
+  test("stops HEAD monitoring before post-scan instructions change the checkout", async () => {
+    const { root, repository, codexHome, scanDir } = await scanDirectories();
+    const releaseRead = Promise.withResolvers<void>();
+    let revision = "deadbeef";
+    let reads = 0;
+    let monitorSignal: AbortSignal | undefined;
+    let turns = 0;
+    let completed = false;
+    const warnings: string[] = [];
+    const client = TestClient.withDependencies({
+      ...scanRuntimeDependencies(codexHome, scanDir),
+      resolvePluginPython: async () => pythonExecutable()!,
+      repositoryRevision: async (_repository, signal) => {
+        if (++reads > 1) {
+          monitorSignal = signal;
+          await releaseRead.promise;
+        }
+        return revision;
+      },
+      runWorkbench: async (_options, args, input) => {
+        if (args[0] === "complete-scan") {
+          completed = true;
+          return { scan: { warnings: [] }, targetWarnings: [] };
+        }
+        return mockWorkbench(args, input);
+      },
+      createCodex: codexFactory(async () => {
+        if (++turns === 1) {
+          await copyCompletedScan(root);
+          return { events: completedEvents() };
+        }
+        expect(completed).toBe(true);
+        revision = "temporary-follow-up-revision";
+        releaseRead.resolve();
+        // Let the pending read and warning observer settle without a polling delay.
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        revision = "deadbeef";
+        expect(monitorSignal?.aborted).toBe(true);
+        return { events: completedEvents() };
+      }, "thread-1"),
+    });
+    try {
+      const result = await client.run(repository, {
+        postScanPrompt:
+          "Inspect another local revision and restore the checkout.",
+        onWarning: (message, details) => {
+          if (details?.kind === "target_changed") warnings.push(message);
+        },
+      });
+      expect(turns).toBe(2);
+      expect(result.coverage.completeness).toBe("complete");
+      expect(revision).toBe("deadbeef");
+      expect(warnings).toEqual([]);
+    } finally {
+      releaseRead.resolve();
+      await client.close();
+    }
+  });
+
   test.each([
     "repository",
     "worktree",
