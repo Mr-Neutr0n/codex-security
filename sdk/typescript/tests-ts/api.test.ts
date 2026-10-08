@@ -3112,8 +3112,8 @@ describe("CodexSecurity orchestration", () => {
       });
       try {
         await client.run(repository, {
-          onWarning: (_message, detail) => {
-            if (detail?.kind !== "target_changed") return;
+          onWarning: (message, detail) => {
+            if (!message.startsWith("Repository HEAD changed")) return;
             expect(completed).toBe(false);
             details.push(detail);
             warningSeen.resolve();
@@ -3124,7 +3124,7 @@ describe("CodexSecurity orchestration", () => {
           },
         });
         completed = true;
-        expect(details).toEqual([{ kind: "target_changed" }]);
+        expect(details).toEqual([undefined]);
       } finally {
         await client.close();
       }
@@ -3189,8 +3189,9 @@ describe("CodexSecurity orchestration", () => {
         const result = client.run(repository, {
           postScanPrompt:
             "Inspect another local revision and restore the checkout.",
-          onWarning: (message, details) => {
-            if (details?.kind === "target_changed") warnings.push(message);
+          onWarning: (message) => {
+            if (message.startsWith("Repository HEAD changed"))
+              warnings.push(message);
           },
         });
         if (outcome === "success")

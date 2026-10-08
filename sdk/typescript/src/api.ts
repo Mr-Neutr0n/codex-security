@@ -1791,9 +1791,11 @@ export class CodexSecurity {
             readRepositoryRevision(repo, revisionSignal),
           signal,
           onDrift: () =>
-            notifyObserver(options, "onWarning")(
+            notifyObserver(
+              options,
+              "onWarning",
+            )(
               "Repository HEAD changed while the scan was running; results remain bound to the original revision.",
-              { kind: "target_changed" },
             ),
         });
       }
