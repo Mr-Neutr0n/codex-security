@@ -120,7 +120,7 @@ npm audit signatures --registry=https://registry.npmjs.org/ --json --include-att
 
 The release workflows additionally check that the verified SLSA attestation
 matches the package tarball, expected release workflow, and tagged commit; see
-[release verification](../../RELEASING.md#verify). Only historical releases
+[release verification](https://github.com/openai/codex-security/blob/main/RELEASING.md#verify). Only historical releases
 `0.1.0` and `0.1.1` may omit registry `gitHead`: the release verifier recovers it
 from verified provenance. Later releases require a matching `gitHead`.
 
