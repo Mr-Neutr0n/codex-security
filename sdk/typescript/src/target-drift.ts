@@ -17,23 +17,21 @@ const DEFAULT_HEAD_DRIFT_INTERVAL_MS = 1_000;
 export function startHeadDriftMonitor(
   options: HeadDriftMonitorOptions,
 ): HeadDriftMonitor {
-  let stopped = false;
-  let warned = false;
+  const controller = new AbortController();
+  const signal = AbortSignal.any([options.signal, controller.signal]);
   let checking = false;
 
   const check = async (): Promise<void> => {
-    if (stopped || warned || options.signal.aborted || checking) return;
+    if (signal.aborted || checking) return;
     checking = true;
     try {
-      const revision = await options.readRevision(options.signal);
+      const revision = await options.readRevision(signal);
       if (
-        !stopped &&
-        !options.signal.aborted &&
+        !signal.aborted &&
         revision !== null &&
-        revision !== options.expectedRevision &&
-        !warned
+        revision !== options.expectedRevision
       ) {
-        warned = true;
+        stop();
         options.onDrift();
       }
     } catch {
@@ -49,15 +47,12 @@ export function startHeadDriftMonitor(
     void check();
   }, options.intervalMs ?? DEFAULT_HEAD_DRIFT_INTERVAL_MS);
   timer.unref();
-  const ready = check();
-
-  return {
-    ready,
-    check,
-    stop: () => {
-      if (stopped) return;
-      stopped = true;
-      clearInterval(timer);
-    },
+  const stop = () => {
+    clearInterval(timer);
+    controller.abort();
   };
+  signal.addEventListener("abort", () => clearInterval(timer), { once: true });
+  if (signal.aborted) clearInterval(timer);
+
+  return { ready: check(), check, stop };
 }
