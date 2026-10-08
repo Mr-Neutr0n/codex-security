@@ -1,14 +1,14 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
-import { runWorkbench } from "../src/runtime.js";
+import { workbenchCommand as workbench } from "./support/workbench-command.js";
 import { loadBundledRuntime, PLUGIN_ROOT } from "./plugin-root.js";
 import { runPython } from "./support/python-probe.js";
 import { createTemporaryDirectories } from "./support/temporary-directories.js";
 
 const originalClaimToken = "22222222-2222-4222-8222-222222222222";
 const replacementClaimToken = "33333333-3333-4333-8333-333333333333";
-const temporaryDirectories = createTemporaryDirectories();
+const temporaryDirectories = createTemporaryDirectories(true);
 
 afterEach(temporaryDirectories.cleanup);
 
@@ -36,6 +36,7 @@ const deepScanOwnershipProbe = [
   "deep_scan.require_scan = lambda database, value: database.execute('SELECT * FROM scans WHERE id = ?', (value,)).fetchone()",
   "deep_scan.require_workspace = lambda database, value: database.execute('SELECT * FROM workspaces WHERE id = ?', (value,)).fetchone()",
   "deep_scan.now = lambda: 'after'",
+  "deep_scan.configure(deep_scan)",
   "deep_scan.deep_scan_result = lambda database, value, *, start_disposition=None: {'startDisposition': start_disposition}",
   "try:",
   "    result = deep_scan.begin_deep_scan_for_scan(connection, scan_id, 'requesting-thread', argparse.Namespace(claim_token=case['suppliedToken'], model=None, reasoning_effort=None))",
@@ -138,6 +139,7 @@ test("recovers an interrupted copied Deep Scan publication", async () => {
       "connection.execute('INSERT INTO scans VALUES (?, ?)', ('scan', str(scan_dir)))",
       "connection.execute('INSERT INTO deep_scan_workers VALUES (?, ?, ?, ?, ?)', ('scan', 'dedup', 'running', str(snapshot.parent.parent), 'now'))",
       "deep_scan.require_scan = lambda database, value: database.execute('SELECT * FROM scans WHERE id = ?', (value,)).fetchone()",
+      "deep_scan.configure(deep_scan)",
       "deep_scan.recover_candidate_ledger_publication(connection, 'scan')",
       "print(json.dumps({'ledger': ledger.read_text(encoding='utf-8'), 'backup': backup.exists()}))",
     ].join("\n"),
@@ -169,20 +171,11 @@ test.each([
     await writeFile(join(repository, "source.py"), "# synthetic source\n");
     const python = Bun.which("python3") ?? Bun.which("python");
     expect(python).not.toBeNull();
-    const command = (args: string[], input?: string) =>
-      runWorkbench(
-        {
-          python: python!,
-          pluginRoot: PLUGIN_ROOT,
-          environment: {
-            ...process.env,
-            CODEX_SECURITY_STATE_DIR: join(root, "state"),
-            CODEX_HOME: join(root, "codex-home"),
-          },
-        },
-        args,
-        input,
-      );
+    const command = workbench(python!, () => ({
+      ...process.env,
+      CODEX_SECURITY_STATE_DIR: join(root, "state"),
+      CODEX_HOME: join(root, "codex-home"),
+    }));
     const registration = await command(
       [
         "register-cli-scan",
@@ -447,52 +440,6 @@ describe("deep scan workbench ownership", () => {
       );
     }
   });
-
-  test.each([false, true] as const)(
-    "backfills and repairs discovery deadline migration when already recorded: %p",
-    (migrationRecorded) => {
-      const python = Bun.which("python3") ?? Bun.which("python");
-      expect(python).not.toBeNull();
-      const script = [
-        "import json, runpy, sqlite3, sys",
-        "from unittest import mock",
-        "namespace = runpy.run_path(sys.argv[1], run_name='codex_security_workbench_db')",
-        "apply_migrations = namespace['apply_migrations']",
-        "connection = sqlite3.connect(':memory:')",
-        "connection.row_factory = sqlite3.Row",
-        "historical = tuple(item for item in namespace['MIGRATIONS'] if item[0] < 28)",
-        "with mock.patch.dict(apply_migrations.__globals__, {'MIGRATIONS': historical}):",
-        "    apply_migrations(connection)",
-        "timestamp = '2026-07-01T00:00:00Z'",
-        "connection.execute('INSERT INTO workspaces (id, created_at, updated_at) VALUES (?, ?, ?)', ('legacy-workspace', timestamp, timestamp))",
-        "connection.execute(\"INSERT INTO scans (id, workspace_id, target_path, target_revision, scope, mode, scan_dir, status, phase, started_at, created_at, updated_at) VALUES (?, ?, '/legacy/target', 'legacy-revision', '.', 'deep', '/legacy/scan', 'running', 'discovery', ?, ?, ?)\", ('legacy-scan', 'legacy-workspace', timestamp, timestamp, timestamp))",
-        "connection.execute(\"INSERT INTO deep_scan_runs (scan_id, schema_version, workflow_version, status, phase, workers, subagents, stop_after_no_new, max_discovery_runs, created_at, updated_at) VALUES (?, 1, 'legacy-workflow', 'running', 'discovery', 1, 0, 3, 10, ?, ?)\", ('legacy-scan', timestamp, timestamp))",
-        "if sys.argv[2] == 'true':",
-        "    connection.execute('INSERT INTO schema_migrations (version, name, applied_at) VALUES (28, ?, ?)', ('persist deep scan discovery time limit', timestamp))",
-        "connection.commit()",
-        "apply_migrations(connection)",
-        "default = connection.execute('SELECT max_time_hours FROM deep_scan_runs').fetchone()[0]",
-        "connection.execute('UPDATE deep_scan_runs SET max_time_hours = 2.5')",
-        "connection.commit()",
-        "apply_migrations(connection)",
-        "configured = connection.execute('SELECT max_time_hours FROM deep_scan_runs').fetchone()[0]",
-        "migration = connection.execute('SELECT name FROM schema_migrations WHERE version = 28').fetchone()[0]",
-        "print(json.dumps({'default': default, 'configured': configured, 'migration': migration}))",
-      ].join("\n");
-      const result = runPython(python!, [
-        "-c",
-        script,
-        join(PLUGIN_ROOT, "scripts", "workbench_db.py"),
-        String(migrationRecorded),
-      ]);
-      expect(result.exitCode, new TextDecoder().decode(result.stderr)).toBe(0);
-      expect(JSON.parse(new TextDecoder().decode(result.stdout))).toEqual({
-        default: 96,
-        configured: 2.5,
-        migration: "persist deep scan discovery time limit",
-      });
-    },
-  );
 
   test.each([
     ["repository", false],

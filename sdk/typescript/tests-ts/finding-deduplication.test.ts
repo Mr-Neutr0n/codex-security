@@ -1,7 +1,8 @@
-import { chmod, cp, mkdtemp, readFile, rm } from "node:fs/promises";
+import { emptyNeighborhoodReviewer } from "./support/deduplication.js";
+import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { expect, test } from "bun:test";
+import { expect, test, mock } from "bun:test";
 import Ajv2020 from "ajv/dist/2020.js";
 import type { Finding, FindingsDocument } from "../src/models.js";
 import type { CodexReview } from "../src/deduplication/codex-review.js";
@@ -11,6 +12,7 @@ import {
 } from "../src/deduplication/deduplication.js";
 import {
   CodexDeduplicationReviewer,
+  CodexGroupingReviewer,
   pairKey,
   screeningPairSlot,
   validateReview,
@@ -26,8 +28,9 @@ import {
   deduplicateScanDirectoryInternal,
   deduplicateScanInternal,
 } from "../src/deduplication/scan.js";
-import { PLUGIN_ROOT } from "./plugin-root.js";
+import { copyCompletedScanFixture, PLUGIN_ROOT } from "./plugin-root.js";
 import type { JsonObject } from "../src/config.js";
+import { fail } from "./support/errors.js";
 
 const document: FindingsDocument = JSON.parse(
   await readFile(
@@ -49,11 +52,11 @@ function entry(index: number): Finding {
     },
   };
 }
-function candidates(findings: Finding[]) {
+function candidates(findings: Finding[], neighbors = findings) {
   return {
     potentialDuplicates: async (id: string) => ({
       finding: findings.find((finding) => finding.findingId === id)!,
-      potentialDuplicates: findings.filter(
+      potentialDuplicates: neighbors.filter(
         (finding) => finding.findingId !== id,
       ),
     }),
@@ -79,6 +82,51 @@ const distinct: DuplicateDecision = {
   rationale: "Independent controls require different corrections.",
 };
 
+test("saved-scan pair reviews submit decisions without generating replacement findings", async () => {
+  const findings = [entry(1), entry(2)];
+  const originals = structuredClone(findings);
+  const calls: CodexReview<unknown>[] = [];
+  const reviewer = new CodexGroupingReviewer(
+    {
+      async run<T>(review: CodexReview<T>): Promise<T> {
+        calls.push(review);
+        const result = {
+          decision: "SAME",
+          rationale: "One shared control closes both paths.",
+        };
+        const validateSchema = new Ajv2020({ strict: false }).compile(
+          review.schema as object,
+        );
+        expect(validateSchema(result)).toBe(true);
+        expect(
+          validateSchema({
+            ...result,
+            mergedFinding: findings[0],
+            canonicalFindingId: findings[0]!.findingId,
+          }),
+        ).toBe(false);
+        return review.validate(result);
+      },
+    },
+    { model: "synthetic-configured-model", model_reasoning_effort: "medium" },
+  );
+  expect(await reviewer.reviewPair(findings)).toEqual({
+    decision: "SAME",
+    rationale: "One shared control closes both paths.",
+  });
+  expect(calls[0]).toMatchObject({
+    stage: "pair-review",
+    model: "synthetic-configured-model",
+    effort: "medium",
+  });
+  expect(calls[0]!.prompt).toContain(JSON.stringify({ findings }));
+  expect(calls[0]!.prompt).not.toContain("actually synthesize");
+  expect(findings).toEqual(originals);
+  expect(() =>
+    validateReview({ decision: "SAME", rationale: "Same control" }, findings),
+  ).toThrow();
+});
+
 function screening(
   findings: readonly Finding[],
   nominated: ReadonlySet<string>,
@@ -101,6 +149,12 @@ function screening(
   };
 }
 
+const reviewSame = async (findings: readonly Finding[]) => same(findings);
+const screenNominations =
+  (nominate: (findings: readonly Finding[]) => ReadonlySet<string>) =>
+  async (findings: readonly Finding[]) =>
+    screening(findings, nominate(findings));
+
 test.each(["screening", "pair-review"])(
   "%s fills each free slot immediately and preserves serial grouping",
   async (stage) => {
@@ -110,14 +164,7 @@ test.each(["screening", "pair-review"])(
     const nominations = new Set(
       ids.map((id) => pairKey([id, neighbor.findingId])),
     );
-    const candidates = {
-      async potentialDuplicates(id: string) {
-        return {
-          finding: entries[ids.indexOf(id)]!,
-          potentialDuplicates: [neighbor],
-        };
-      },
-    };
+    const candidateStore = candidates(entries, [neighbor]);
     const gates = entries.map(() => Promise.withResolvers<void>());
     const started = entries.map(() => Promise.withResolvers<void>());
     const starts: number[] = [];
@@ -145,7 +192,7 @@ test.each(["screening", "pair-review"])(
       },
     };
     const result = new FindingDeduplicator(
-      candidates,
+      candidateStore,
       reviewer,
       undefined,
       2,
@@ -164,7 +211,7 @@ test.each(["screening", "pair-review"])(
     expect(phases.filter((phase) => phase === "screening")).toHaveLength(4);
     expect(phases.filter((phase) => phase === "pair-review")).toHaveLength(4);
     expect(parallel).toEqual(
-      await new FindingDeduplicator(candidates, reviewer, undefined, 1).run(
+      await new FindingDeduplicator(candidateStore, reviewer, undefined, 1).run(
         ids,
       ),
     );
@@ -193,14 +240,7 @@ test("ready pairs take free slots before pending screenings and share the concur
     active--;
   };
   const result = new FindingDeduplicator(
-    {
-      async potentialDuplicates(id) {
-        return {
-          finding: entries[ids.indexOf(id)]!,
-          potentialDuplicates: [neighbor],
-        };
-      },
-    },
+    candidates(entries, [neighbor]),
     {
       async screen(findings) {
         await hold(ids.indexOf(findings[0]!.findingId), "screen");
@@ -385,14 +425,7 @@ test.each(["screen", "pair", "cancel"])(
     const controller = new AbortController();
     const failure = new Error("Synthetic mixed-stage failure");
     const result = new FindingDeduplicator(
-      {
-        async potentialDuplicates(id) {
-          return {
-            finding: entries[ids.indexOf(id)]!,
-            potentialDuplicates: neighbors,
-          };
-        },
-      },
+      candidates(entries, neighbors),
       {
         async screen(findings) {
           const index = ids.indexOf(findings[0]!.findingId);
@@ -419,11 +452,10 @@ test.each(["screen", "pair", "cancel"])(
       controller.signal,
       2,
     ).run(ids);
-    let settled = false;
-    const observed = result.catch((error: unknown) => {
-      settled = true;
+    const observeSettled = mock((error: unknown) => {
       return error;
     });
+    const observed = result.catch(observeSettled);
     try {
       await pairStarted.promise;
       expect(starts).toEqual(["screen:0", "screen:1", "pair"]);
@@ -431,7 +463,7 @@ test.each(["screen", "pair", "cancel"])(
       else if (failureStage === "pair") pairGate.reject(failure);
       else controller.abort(failure);
       await new Promise<void>((resolve) => setImmediate(resolve));
-      expect(settled).toBe(false);
+      expect(observeSettled).not.toHaveBeenCalled();
       screenGate.resolve();
       pairGate.resolve();
       expect(await observed).toBe(failure);
@@ -465,22 +497,20 @@ test("terminal failure drains started reviews without starting queued jobs", asy
         await gates[index]!.promise;
         return screening(findings, new Set());
       },
-      async reviewPair() {
-        throw new Error("Pair review must not start after screening failure");
-      },
+      reviewPair: async () =>
+        fail("Pair review must not start after screening failure"),
     },
     undefined,
     2,
   ).run(entries.map((entry) => entry.findingId));
-  let settled = false;
-  const observed = result.catch((error: unknown) => {
-    settled = true;
+  const observeSettled = mock((error: unknown) => {
     return error;
   });
+  const observed = result.catch(observeSettled);
   await Promise.all([started[0]!.promise, started[1]!.promise]);
   gates[0]!.reject(failure);
   await new Promise<void>((resolve) => setImmediate(resolve));
-  expect(settled).toBe(false);
+  expect(observeSettled).not.toHaveBeenCalled();
   gates[1]!.resolve();
   expect(await observed).toBe(failure);
   expect(calls).toEqual(entries.slice(0, 2).map((entry) => entry.findingId));
@@ -562,9 +592,7 @@ test("groups accepted neighbors transitively without screening them as anchors",
         new Set([pairKey([ids[0]!, ids[1]!]), pairKey([ids[1]!, ids[2]!])]),
       );
     },
-    async reviewPair(findings) {
-      return same(findings);
-    },
+    reviewPair: reviewSame,
   });
   expect(await service.run([ids[1]!])).toEqual({
     uniqueFindingIds: [ids[0]!],
@@ -578,27 +606,19 @@ test("an explicit DISTINCT screening vetoes the same unordered pair", async () =
   const entries = [entry(1), entry(2)];
   const ids = entries.map((finding) => finding.findingId);
   for (const selected of [ids, [...ids].reverse()]) {
-    let pairReviews = 0;
+    const reviewPair = mock(reviewSame.bind(undefined, entries));
     const service = new FindingDeduplicator(candidates(entries), {
-      async screen(findings) {
-        return screening(
-          findings,
-          findings[0]!.findingId === ids[0]
-            ? new Set([pairKey(ids)])
-            : new Set(),
-        );
-      },
-      async reviewPair() {
-        pairReviews += 1;
-        return same(entries);
-      },
+      screen: screenNominations((findings) =>
+        findings[0]!.findingId === ids[0] ? new Set([pairKey(ids)]) : new Set(),
+      ),
+      reviewPair,
     });
     expect(await service.run(selected)).toEqual({
       uniqueFindingIds: selected,
       duplicateGroups: [],
       deduplicationStatus: "completed",
     });
-    expect(pairReviews).toBe(0);
+    expect(reviewPair).toHaveBeenCalledTimes(0);
   }
 });
 
@@ -611,9 +631,7 @@ test("does not connect DISTINCT findings through accepted transitive pairs", asy
   ]);
   const reviewedPairs: string[] = [];
   const service = new FindingDeduplicator(candidates(entries), {
-    async screen(findings) {
-      return screening(findings, nominations);
-    },
+    screen: screenNominations(() => nominations),
     async reviewPair(findings) {
       reviewedPairs.push(pairKey(findings.map((finding) => finding.findingId)));
       return same(findings);
@@ -638,9 +656,7 @@ test("does not connect findings through a pair rejected by Sol", async () => {
   ]);
   const reviewedPairs: string[] = [];
   const service = new FindingDeduplicator(candidates(entries), {
-    async screen(findings) {
-      return screening(findings, nominations);
-    },
+    screen: screenNominations(() => nominations),
     async reviewPair(findings) {
       const key = pairKey(findings.map((finding) => finding.findingId));
       reviewedPairs.push(key);
@@ -679,12 +695,8 @@ test("prefers the better-supported legal subgroup in a conflicted star", async (
       },
     },
     {
-      async screen(findings) {
-        return screening(findings, nominations);
-      },
-      async reviewPair(findings) {
-        return same(findings);
-      },
+      screen: screenNominations(() => nominations),
+      reviewPair: reviewSame,
     },
   );
   expect(await service.run(ids)).toEqual({
@@ -759,12 +771,8 @@ test("keeps disconnected groups ordered and conflict ties in finding insertion o
         },
       },
       {
-        async screen(findings) {
-          return screening(findings, nominations);
-        },
-        async reviewPair(findings) {
-          return same(findings);
-        },
+        screen: screenNominations(() => nominations),
+        reviewPair: reviewSame,
       },
     );
     expect(
@@ -820,12 +828,8 @@ test("matches an import to an existing canonical", async () => {
   imported.severity.level = "low";
   const ids = [existing.findingId, imported.findingId];
   const service = new FindingDeduplicator(candidates([existing, imported]), {
-    async screen(findings) {
-      return screening(findings, new Set([pairKey(ids)]));
-    },
-    async reviewPair(findings) {
-      return same(findings);
-    },
+    screen: screenNominations(() => new Set([pairKey(ids)])),
+    reviewPair: reviewSame,
   });
   expect(await service.run([imported.findingId])).toEqual({
     uniqueFindingIds: [existing.findingId],
@@ -840,12 +844,8 @@ test("empty and isolated imports avoid models, while review failures propagate",
   const findings = [first];
   const failure = new CodexSecurityError("Synthetic review failed");
   const reviewer: DeduplicationReviewer = {
-    async screen() {
-      throw failure;
-    },
-    async reviewPair() {
-      throw failure;
-    },
+    screen: (Promise.reject<never>).bind(Promise, failure),
+    reviewPair: (Promise.reject<never>).bind(Promise, failure),
   };
   const service = new FindingDeduplicator(candidates(findings), reviewer);
   expect(await service.run([])).toEqual({
@@ -1160,9 +1160,7 @@ test("accepts complete canonical and merged reviews and rejects invalid assignme
 test("resolves a saved scan and retrieves its IDs without uploading or modifying artifacts", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dedupe-scan-"));
   try {
-    await cp(join(PLUGIN_ROOT, "examples/completed-scan"), directory, {
-      recursive: true,
-    });
+    await copyCompletedScanFixture(directory);
     if (process.platform !== "win32") await chmod(directory, 0o700);
     const original = await readFile(join(directory, "findings.json"), "utf8");
     for (const [requestedId, allRepositories] of [
@@ -1199,14 +1197,7 @@ test("resolves a saved scan and retrieves its IDs without uploading or modifying
               potentialDuplicates: [],
             });
           },
-          reviewer: {
-            async screen() {
-              throw new Error("No review for an empty neighborhood");
-            },
-            async reviewPair() {
-              throw new Error("No pair to review");
-            },
-          },
+          reviewer: emptyNeighborhoodReviewer(),
         },
       );
       expect(result).toEqual({
@@ -1247,11 +1238,8 @@ test("resolves a saved scan and retrieves its IDs without uploading or modifying
               progress: { status: "complete" },
             },
           }),
-          fetch: async () => {
-            throw new Error(
-              "Must not retrieve candidates for a mismatched scan",
-            );
-          },
+          fetch: async () =>
+            fail("Must not retrieve candidates for a mismatched scan"),
         },
       ),
     ).rejects.toThrow("do not match selected scan");
@@ -1264,9 +1252,7 @@ test("deduplicates an explicit sealed scan directory without reading scan histor
   const directory = await mkdtemp(join(tmpdir(), "dedupe-directory-"));
   const repository = await mkdtemp(join(tmpdir(), "dedupe-repository-"));
   try {
-    await cp(join(PLUGIN_ROOT, "examples/completed-scan"), directory, {
-      recursive: true,
-    });
+    await copyCompletedScanFixture(directory);
     if (process.platform !== "win32") await chmod(directory, 0o700);
     const original = await readFile(join(directory, "findings.json"), "utf8");
     const commands: string[][] = [];
@@ -1291,14 +1277,7 @@ test("deduplicates an explicit sealed scan directory without reading scan histor
             potentialDuplicates: [],
           });
         },
-        reviewer: {
-          async screen() {
-            throw new Error("No review for an empty neighborhood");
-          },
-          async reviewPair() {
-            throw new Error("No pair to review");
-          },
-        },
+        reviewer: emptyNeighborhoodReviewer(),
       },
     );
     expect(result).toEqual({
@@ -1360,9 +1339,7 @@ test("lookup failures and cancellation never produce a completed uniqueness resu
 test("writes accepted groups only after all reviews and fails on review or write-back errors", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dedupe-writeback-"));
   try {
-    await cp(join(PLUGIN_ROOT, "examples/completed-scan"), directory, {
-      recursive: true,
-    });
+    await copyCompletedScanFixture(directory);
     if (process.platform !== "win32") await chmod(directory, 0o700);
     const findings = [document.findings[0]!, entry(2), entry(3)];
     const ids = findings.map((finding) => finding.findingId);
