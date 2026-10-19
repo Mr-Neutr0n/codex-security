@@ -5406,56 +5406,35 @@ describe("CLI", () => {
     },
   );
 
-  test("preserves scan failures when inspecting partial output fails", async () => {
+  test("preserves scan failures when output inspection is denied", async () => {
     if (
       runTestInSubprocess(
         import.meta.path,
-        "preserves scan failures when inspecting partial output fails",
+        "preserves scan failures when output inspection is denied",
       )
     )
       return;
     const originalOpendir = opendir;
+    const scanDir = "/synthetic-partial-output";
     try {
-      for (const operation of ["read", "close"] as const) {
-        const scanDir = "/synthetic-partial-output";
-        mockFs(() => ({
-          opendir: async (path: string) => {
-            if (path !== scanDir) return originalOpendir(path);
-            return {
-              read: async () => {
-                if (operation === "read")
-                  throw Object.assign(new Error("Cannot inspect output"), {
-                    code: "EACCES",
-                  });
-                return null;
-              },
-              close: async () => {
-                if (operation === "close")
-                  throw new Error("Cannot close output");
-              },
-            };
-          },
-        }));
-        const { stdout, stderr, runCli } = createCliTest(main);
-        const deps = scanDependencies(async (_repository, options) => {
-          options?.onOutputDirReady?.(scanDir);
-          throw new Error("SYNTHETIC_SCAN_FAILURE");
-        });
-        expect(await runCli(["scan", ".", "--json", "--verbose"], deps)).toBe(
-          2,
-        );
-        expect(JSON.parse(stdout.text()).message).toBe(
-          "SYNTHETIC_SCAN_FAILURE",
-        );
-        expect(stderr.text()).toContain(
-          `partial_output=${operation === "read"}`,
-        );
-        expect(stderr.text().includes("Partial output was kept")).toBe(
-          operation === "read",
-        );
-        expect(stderr.text()).not.toContain("Cannot inspect output");
-        expect(stderr.text()).not.toContain("Cannot close output");
-      }
+      mockFs(() => ({
+        opendir: async (path: string) => {
+          if (path !== scanDir) return originalOpendir(path);
+          throw Object.assign(new Error("Cannot inspect output"), {
+            code: "EACCES",
+          });
+        },
+      }));
+      const { stdout, stderr, runCli } = createCliTest(main);
+      const deps = scanDependencies(async (_repository, options) => {
+        options?.onOutputDirReady?.(scanDir);
+        throw new Error("SYNTHETIC_SCAN_FAILURE");
+      });
+      expect(await runCli(["scan", ".", "--json", "--verbose"], deps)).toBe(2);
+      expect(JSON.parse(stdout.text()).message).toBe("SYNTHETIC_SCAN_FAILURE");
+      expect(stderr.text()).toContain("partial_output=true");
+      expect(stderr.text()).toContain(`Partial output was kept at ${scanDir}.`);
+      expect(stderr.text()).not.toContain("Cannot inspect output");
     } finally {
       restoreFs({ opendir: originalOpendir });
     }

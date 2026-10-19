@@ -8124,10 +8124,9 @@ function incurErrorMessage(output: string): string {
 }
 
 async function hasPartialOutput(path: string): Promise<boolean> {
-  let directory: Awaited<ReturnType<typeof opendir>> | undefined;
   try {
-    directory = await opendir(path);
-    return (await directory.read()) !== null;
+    for await (const _entry of await opendir(path)) return true;
+    return false;
   } catch (error: unknown) {
     return !(
       typeof error === "object" &&
@@ -8135,10 +8134,6 @@ async function hasPartialOutput(path: string): Promise<boolean> {
       "code" in error &&
       error.code === "ENOENT"
     );
-  } finally {
-    try {
-      await directory?.close();
-    } catch {}
   }
 }
 
