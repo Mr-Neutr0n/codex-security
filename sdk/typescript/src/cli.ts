@@ -28,7 +28,6 @@ import {
   mkdir,
   mkdtemp,
   open,
-  opendir,
   readFile,
   readdir,
   readlink,
@@ -213,8 +212,8 @@ import {
   OutputInsideProtectedRootError,
   PluginPythonUnavailableError,
   errorMessage,
-  scanCostLimitFailureMessage,
   ScanCostLimitExceededError,
+  ScanInterruptedError,
 } from "./errors.js";
 import {
   GITHUB_ADVISORY_STATES,
@@ -9032,33 +9031,6 @@ function incurErrorMessage(output: string): string {
   return typeof parsed === "string" ? parsed : message;
 }
 
-async function scanDirectoryIsEmpty(path: string): Promise<boolean> {
-  try {
-    if (relative(path, await realpath(path)) !== "") return false;
-    const directory = await opendir(path);
-    try {
-      return (await directory.read()) === null;
-    } finally {
-      await directory.close();
-    }
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    return code === "ENOENT" || code === "ENOTDIR";
-  }
-}
-
-function partialOutputMessage(
-  scanDir: string | null,
-  present: boolean | undefined,
-): string {
-  if (scanDir === null) return "No partial output was kept.";
-  if (present === false)
-    return `No scan output was found in ${errorMessage(scanDir)}.`;
-  return present
-    ? `Partial output was kept at ${errorMessage(scanDir)}.`
-    : `Output directory: ${errorMessage(scanDir)}`;
-}
-
 type VerboseDiagnosticValue = string | number | boolean | null | undefined;
 
 function diagnosticLines(value: unknown): string {
@@ -9913,12 +9885,9 @@ async function executeScan(
             errorOutput.write(
               `codex-security: Validation failed: ${diagnosticValue(message)}\n`,
             );
-            if (
-              requestedSignal === null &&
-              validation["reportPath"] !== undefined
-            ) {
+            if (validation["reportPath"] !== undefined) {
               errorOutput.write(
-                `Partial validation report: ${diagnosticValue(validation["reportPath"])}\n`,
+                `Validation report opened at ${diagnosticValue(validation["reportPath"])}\n`,
               );
             }
           }
@@ -9948,29 +9917,7 @@ async function executeScan(
     removeSignalListeners();
   }
 
-  if (requestedSignal !== null && result !== null && arguments_.validate) {
-    diagnostic("scan.interrupted", { signal: requestedSignal });
-    const exitCode = requestedSignal === "SIGINT" ? 130 : 143;
-    const scanId = quoteCliPath(diagnosticValue(result.manifest.scan.id));
-    const message = `Validation interrupted. Run codex-security scans show ${scanId} to inspect the completed scan.`;
-    errorOutput.write(`codex-security: ${message}\n`);
-    const reportPath = validation?.["reportPath"];
-    if (typeof reportPath === "string")
-      errorOutput.write(
-        `Validation report filename: ${basename(reportPath)}\n`,
-      );
-    return {
-      exitCode,
-      error: message,
-      data: {
-        ...result.toJSON(),
-        validation: { ...validation, status: "failed", exitCode },
-      },
-    };
-  }
-
   let failureData: Record<string, unknown> | undefined;
-  let verifiedScanDir: string | undefined;
   if (
     arguments_.includeFailureResults &&
     (failed || requestedSignal !== null)
@@ -9985,7 +9932,6 @@ async function executeScan(
           pluginRoot: await bundledPluginRoot(),
           expectedScanId: registeredScan.scanId,
         });
-        verifiedScanDir = registeredScan.scanDir;
         failureData = {
           ...contract,
           scanDir: registeredScan.scanDir,
@@ -9997,31 +9943,25 @@ async function executeScan(
     }
   }
 
-  const costLimitFailure =
-    failure instanceof ScanCostLimitExceededError ? failure : undefined;
-  const failedScanDir = costLimitFailure?.scanDir ?? scanDir;
-  let outputAtPath: boolean | undefined;
-  if (failed || requestedSignal !== null) {
-    if (failedScanDir === null) outputAtPath = false;
-    else if (failedScanDir === verifiedScanDir) outputAtPath = true;
-    else if (await scanDirectoryIsEmpty(failedScanDir)) outputAtPath = false;
-  }
-  // A registered scan may already have been archived under its saved ID.
-  const partialOutput =
-    outputAtPath === false && registeredScan !== undefined
-      ? undefined
-      : outputAtPath;
-
   if (requestedSignal !== null) {
     diagnostic("scan.interrupted", {
       signal: requestedSignal,
-      partial_output: partialOutput,
     });
-    const exitCode = interruptedExit(
-      requestedSignal,
-      partialOutputMessage(failedScanDir, outputAtPath),
-      errorOutput,
-    );
+    if (result !== null && arguments_.validate) {
+      const exitCode = requestedSignal === "SIGINT" ? 130 : 143;
+      const scanId = quoteCliPath(diagnosticValue(result.manifest.scan.id));
+      const message = `Validation interrupted. Original output directory: ${errorMessage(result.scanDir)}. Run codex-security scans show ${scanId} to inspect the completed scan.`;
+      errorOutput.write(`codex-security: ${message}\n`);
+      return {
+        exitCode,
+        error: message,
+        data: {
+          ...result.toJSON(),
+          validation: { ...validation, status: "failed", exitCode },
+        },
+      };
+    }
+    const exitCode = interruptedExit(requestedSignal, scanDir, errorOutput);
     printFailedScanReference(registeredScan, phase, arguments_, errorOutput);
     return {
       exitCode,
@@ -10033,23 +9973,16 @@ async function executeScan(
     };
   }
   if (failed) {
+    const costLimitFailure =
+      failure instanceof ScanCostLimitExceededError ? failure : undefined;
     const message =
       failure instanceof OutputInsideProtectedRootError
         ? errorMessage(protectedRootErrorMessage(failure))
-        : costLimitFailure !== undefined
-          ? diagnosticValue(
-              scanCostLimitFailureMessage(
-                costLimitFailure.maxCostUsd,
-                costLimitFailure.cost,
-                costLimitFailure.scanDir,
-                outputAtPath,
-              ),
-            )
-          : scanFailureMessage(
-              failure,
-              selectedAuthentication,
-              providerOptions.provider,
-            );
+        : scanFailureMessage(
+            failure,
+            selectedAuthentication,
+            providerOptions.provider,
+          );
     diagnostic("scan.failed", {
       classification:
         costLimitFailure !== undefined
@@ -10057,7 +9990,6 @@ async function executeScan(
           : isLocalScanFailure(failure)
             ? "local"
             : classifyConnectionFailure(failure),
-      partial_output: partialOutput,
       max_cost_usd: costLimitFailure?.maxCostUsd,
       estimated_usd: costLimitFailure?.cost.estimatedUsd,
       cost_estimate:
@@ -10066,12 +9998,8 @@ async function executeScan(
           : formatScanCost(costLimitFailure.cost),
     });
     errorOutput.write(`${message}\n`);
-    if (
-      costLimitFailure === undefined &&
-      scanDir !== null &&
-      (outputAtPath !== undefined || registeredScan === undefined)
-    ) {
-      errorOutput.write(`${partialOutputMessage(scanDir, outputAtPath)}\n`);
+    if (!(failure instanceof ScanInterruptedError) && scanDir !== null) {
+      errorOutput.write(`Output directory: ${errorMessage(scanDir)}\n`);
     }
     printFailedScanReference(registeredScan, phase, arguments_, errorOutput);
     return { exitCode: 2, error: message, data: failureData };
@@ -11157,14 +11085,18 @@ export class Progress {
 
 function interruptedExit(
   signal: SignalName,
-  outputMessage: string,
+  scanDir: string | null,
   errorOutput: Writable,
 ): number {
   const ctrlC = signal === "SIGINT";
   errorOutput.write(
     `codex-security: Scan ${ctrlC ? "canceled by Ctrl-C" : "terminated by SIGTERM"}.\n`,
   );
-  errorOutput.write(`codex-security: ${outputMessage}\n`);
+  errorOutput.write(
+    scanDir === null
+      ? "codex-security: No output directory was reported.\n"
+      : `codex-security: Output directory: ${errorMessage(scanDir)}\n`,
+  );
   return ctrlC ? 130 : 143;
 }
 

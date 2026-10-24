@@ -1,6 +1,3 @@
-import { writeFile, rm } from "node:fs/promises";
-import { join } from "node:path";
-import { temporaryDirectory } from "./support/temporary-directories.js";
 import { describe, expect, test, mock } from "bun:test";
 import { main } from "../src/cli.js";
 import {
@@ -15,38 +12,28 @@ import { createCliTest, runCapturedCli } from "./support/cli-run.js";
 
 describe("CLI signals", () => {
   test("maps Ctrl-C and SIGTERM to conventional exits and preserves the output location", async () => {
-    const scanDir = await temporaryDirectory("codex-security-signals-");
-    await writeFile(join(scanDir, "progress.log"), "partial\n");
-    const result = fakeResult();
-    Object.defineProperty(result, "scanDir", { value: scanDir });
-    try {
-      for (const [signal, expectedExit, phrase] of [
-        ["SIGINT", 130, "Scan canceled by Ctrl-C."],
-        ["SIGTERM", 143, "Scan terminated by SIGTERM."],
-      ] as const) {
-        const { stdout, stderr, runCli } = createCliTest(main);
+    for (const [signal, expectedExit, phrase] of [
+      ["SIGINT", 130, "Scan canceled by Ctrl-C."],
+      ["SIGTERM", 143, "Scan terminated by SIGTERM."],
+    ] as const) {
+      const { stdout, stderr, runCli } = createCliTest(main);
 
-        const signals = new FakeSignals();
-        const onInterrupt = mock();
-        const exit = await runCli(
-          ["scan", "."],
-          dependencies({
-            signals,
-            result,
-            onRun: () => signals.emit(signal),
-            onInterrupt,
-          }),
-        );
-        expect(exit).toBe(expectedExit);
-        expect(stdout.text()).toBe("");
-        expect(stderr.text()).toContain(phrase);
-        expect(stderr.text()).toContain(`Output directory: ${scanDir}`);
-        expect(stderr.text()).not.toContain("Partial output was kept");
-        expect(onInterrupt).toHaveBeenCalled();
-        expect(signals.listeners.get(signal)?.size).toBe(0);
-      }
-    } finally {
-      await rm(scanDir, { recursive: true, force: true });
+      const signals = new FakeSignals();
+      const onInterrupt = mock();
+      const exit = await runCli(
+        ["scan", "."],
+        dependencies({
+          signals,
+          onRun: () => signals.emit(signal),
+          onInterrupt,
+        }),
+      );
+      expect(exit).toBe(expectedExit);
+      expect(stdout.text()).toBe("");
+      expect(stderr.text()).toContain(phrase);
+      expect(stderr.text()).toContain("Output directory: /tmp/scan");
+      expect(onInterrupt).toHaveBeenCalled();
+      expect(signals.listeners.get(signal)?.size).toBe(0);
     }
   });
 
@@ -65,7 +52,7 @@ describe("CLI signals", () => {
     expect(await runCli(["scan", "."], deps)).toBe(130);
     expect(stdout.text()).toBe("");
     expect(stderr.text()).toContain("Scan canceled by Ctrl-C.");
-    expect(stderr.text()).toContain("No partial output was kept.");
+    expect(stderr.text()).toContain("No output directory was reported.");
   });
 
   test("preserves signals received during client cleanup", async () => {

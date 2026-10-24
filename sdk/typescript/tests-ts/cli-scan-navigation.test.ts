@@ -4,7 +4,6 @@ import { describe, expect, test } from "bun:test";
 import { main } from "../src/cli.js";
 import type { JsonObject } from "../src/config.js";
 import { dependencies, fakeResult } from "./cli-fixtures.js";
-import { copyCompletedScan } from "./plugin-root.js";
 import { createCliTest } from "./support/cli-run.js";
 import { writeJsonLines } from "./support/json.js";
 import { temporaryDirectory } from "./support/temporary-directories.js";
@@ -150,61 +149,15 @@ describe("scan navigation", () => {
     expect(cli.stderr.text()).toContain(result.scanDir);
   });
 
-  test.each([true, false])(
-    "checks a saved full-output contract against the registered scan id (matching %s)",
-    async (matching) => {
-      const root = await temporaryDirectory("failed-scan-contract-");
-      try {
-        const scanDir = await copyCompletedScan(root);
-        const scanId = matching ? "scan_example_001" : latestId;
-        const cli = createCliTest(main);
-        const deps = dependencies({
-          onTurn: (_repository, options) => {
-            options.onOutputDirReady?.(scanDir);
-            options.onScanRegistered?.({ scanId, scanDir, startedAt });
-            throw new Error("Synthetic scan failure");
-          },
-        });
-        expect(
-          await cli.runCli(
-            ["scan", ".", "--json", "--full-output", "--verbose"],
-            deps,
-          ),
-        ).toBe(2);
-        expect(cli.stderr.text()).toContain(`scans show ${scanId}`);
-        if (matching) {
-          expect(JSON.parse(cli.stdout.text()).data.manifest.scan.id).toBe(
-            scanId,
-          );
-          expect(cli.stderr.text()).toContain("partial_output=true");
-          expect(cli.stderr.text()).toContain(
-            `Partial output was kept at ${scanDir}.`,
-          );
-        } else {
-          expect(JSON.parse(cli.stdout.text()).data).toBeUndefined();
-          expect(cli.stderr.text()).not.toContain("partial_output=");
-          expect(cli.stderr.text()).not.toContain("Partial output was kept");
-        }
-      } finally {
-        await rm(root, { recursive: true, force: true });
-      }
-    },
-  );
-
-  test.each([
-    { customPrompts: false, removeOutput: false },
-    { customPrompts: true, removeOutput: false },
-    { customPrompts: false, removeOutput: true },
-  ])(
-    "identifies only the registered scan without a history lookup (%p)",
-    async ({ customPrompts, removeOutput }) => {
+  test.each([false, true])(
+    "identifies only the registered scan without a history lookup (custom prompts: %p)",
+    async (customPrompts) => {
       const root = await temporaryDirectory("failed-scan-navigation-");
       try {
         const scanDir = join(root, "results");
+        await mkdir(scanDir);
         const repository = join(root, "repository");
         await mkdir(repository);
-        await mkdir(scanDir);
-        await writeFile(join(scanDir, "progress.log"), "partial\n");
         const promptFile = join(root, "instructions.md");
         await writeFile(promptFile, "Review the authorized source.");
         const failure = "Reducer could not record its result";
@@ -229,9 +182,6 @@ describe("scan navigation", () => {
           onWorkbench: () => {
             lookups += 1;
             throw new Error("History unavailable");
-          },
-          onClose: async () => {
-            if (removeOutput) await rm(scanDir, { recursive: true });
           },
         });
         expect(
@@ -261,7 +211,6 @@ describe("scan navigation", () => {
         );
         expect(cli.stderr.text()).toContain(`Output directory: ${scanDir}`);
         expect(cli.stderr.text()).not.toContain("partial_output=");
-        expect(cli.stderr.text()).not.toContain("Retained results");
         expect(cli.stderr.text()).not.toContain("Partial output was kept");
         expect(cli.stderr.text()).toContain(`scans show ${latestId}`);
         expect(cli.stderr.text()).toContain(`scans logs ${latestId}`);
