@@ -14,7 +14,7 @@ import { throwing } from "./support/errors.js";
 import { createCliTest, runCapturedCli } from "./support/cli-run.js";
 
 describe("CLI signals", () => {
-  test("maps Ctrl-C and SIGTERM to conventional exits and preserves partial output", async () => {
+  test("maps Ctrl-C and SIGTERM to conventional exits and preserves the output location", async () => {
     const scanDir = await temporaryDirectory("codex-security-signals-");
     await writeFile(join(scanDir, "progress.log"), "partial\n");
     const result = fakeResult();
@@ -40,9 +40,8 @@ describe("CLI signals", () => {
         expect(exit).toBe(expectedExit);
         expect(stdout.text()).toBe("");
         expect(stderr.text()).toContain(phrase);
-        expect(stderr.text()).toContain(
-          `Partial output was kept at ${scanDir}.`,
-        );
+        expect(stderr.text()).toContain(`Output directory: ${scanDir}`);
+        expect(stderr.text()).not.toContain("Partial output was kept");
         expect(onInterrupt).toHaveBeenCalled();
         expect(signals.listeners.get(signal)?.size).toBe(0);
       }

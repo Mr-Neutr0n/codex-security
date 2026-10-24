@@ -5412,13 +5412,13 @@ describe("CLI", () => {
         message: expect.stringContaining("estimated cost"),
       });
       expect(stderr.text()).toContain(
-        `Scan stopped: short-context budget baseline $0.00488 exceeded the $0.004 limit; estimated cost $0.00488–$0.01156 (standard, context unknown, cache writes unknown); partial output remains at ${scanDir}.`,
+        `Scan stopped: short-context budget baseline $0.00488 exceeded the $0.004 limit; estimated cost $0.00488–$0.01156 (standard, context unknown, cache writes unknown); scan output directory: ${scanDir}.`,
       );
       expect(stderr.text()).toMatch(
         /scan\.configuration[^\n]*max_cost_usd=0\.004/u,
       );
       expect(stderr.text()).toContain(
-        'scan.failed classification="cost_limit_exceeded" partial_output=true max_cost_usd=0.004 estimated_usd=0.00488',
+        'scan.failed classification="cost_limit_exceeded" max_cost_usd=0.004 estimated_usd=0.00488',
       );
     } finally {
       await rm(scanDir, { recursive: true, force: true });
@@ -5888,7 +5888,7 @@ describe("CLI", () => {
     }
   });
 
-  test("preserves partial-output guidance for a late protected-root failure", async () => {
+  test("identifies the output directory for a late protected-root failure", async () => {
     const { stdout, stderr, runCli } = createCliTest(main);
 
     const partial = await temporaryDirectory("codex-security-partial-");
@@ -5908,7 +5908,7 @@ describe("CLI", () => {
       expect(stderr.text()).toContain(
         "Isolated Codex runtime directory must be outside the scanned directory and any enclosing Git worktree.",
       );
-      expect(stderr.text()).toContain(`Partial output was kept at ${partial}.`);
+      expect(stderr.text()).toContain(`Output directory: ${partial}`);
       expect(stderr.text()).not.toContain("codex-security:");
     } finally {
       await rm(partial, { recursive: true, force: true });
@@ -5956,7 +5956,14 @@ describe("CLI", () => {
     }
   });
 
-  test.each(["empty", "missing", "file", "knowledge", "nonempty"] as const)(
+  test.each([
+    "empty",
+    "missing",
+    "file",
+    "knowledge",
+    "feedback",
+    "nonempty",
+  ] as const)(
     "reports retained output accurately for %s directories across scan failures",
     async (state) => {
       const root = await temporaryDirectory("codex-security-partial-output-");
@@ -5979,6 +5986,14 @@ describe("CLI", () => {
               sources: ["context.md"],
               documents: { "context.md": "Synthetic guidance." },
             });
+          }
+          if (state === "feedback") {
+            const contextDir = join(scanDir, "artifacts", "01_context");
+            await mkdir(contextDir, { recursive: true });
+            await writeFile(
+              join(contextDir, "false_positive_feedback.json"),
+              "[]",
+            );
           }
           if (state === "nonempty")
             await writeFile(join(scanDir, "report.md"), "partial\n");
@@ -6023,15 +6038,18 @@ describe("CLI", () => {
                 ? 143
                 : 2,
           );
-          const partial = state === "nonempty";
-          expect(stderr.text()).toContain(`partial_output=${partial}`);
+          const empty =
+            state === "empty" || state === "missing" || state === "file";
+          if (empty) expect(stderr.text()).toContain("partial_output=false");
+          else expect(stderr.text()).not.toContain("partial_output=");
+          expect(stderr.text()).not.toContain("Partial output was kept");
           if (failureKind === "cost") {
             const message = JSON.parse(stdout.text()).message;
             expect(message).toContain("estimated cost");
             expect(message).toContain(
-              partial
-                ? `partial output remains at ${scanDir}`
-                : "no partial output was kept",
+              empty
+                ? `no scan output was found in ${scanDir}`
+                : `scan output directory: ${scanDir}`,
             );
             expect(stderr.text()).toContain(message);
           } else {
@@ -6045,17 +6063,15 @@ describe("CLI", () => {
                   : "Scan terminated by SIGTERM.",
               );
               expect(signals.listeners.get(failureKind)?.size).toBe(0);
-              if (!partial)
-                expect(stderr.text()).toContain("No partial output was kept.");
+              if (empty)
+                expect(stderr.text()).toContain(
+                  `No scan output was found in ${scanDir}.`,
+                );
             }
-            if (partial)
-              expect(stderr.text()).toContain(
-                `Partial output was kept at ${scanDir}.`,
-              );
-            else
-              expect(stderr.text()).not.toContain("Partial output was kept at");
+            if (!empty)
+              expect(stderr.text()).toContain(`Output directory: ${scanDir}`);
           }
-          if (partial)
+          if (state === "nonempty")
             expect(await readFile(join(scanDir, "report.md"), "utf8")).toBe(
               "partial\n",
             );
@@ -6174,9 +6190,7 @@ describe("CLI", () => {
           expect(stdout.text()).toBe("");
         }
         expect(stderr.text()).toContain("SYNTHETIC_AUTH_HOME_CLEANUP_FAILED");
-        expect(stderr.text()).toContain(
-          `Partial output was kept at ${scanDir}.`,
-        );
+        expect(stderr.text()).toContain(`Output directory: ${scanDir}`);
       }
     } finally {
       await rm(scanDir, { recursive: true, force: true });

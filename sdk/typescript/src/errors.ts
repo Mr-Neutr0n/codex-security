@@ -110,6 +110,7 @@ export function scanCostLimitFailureMessage(
 ): string {
   let output = `scan output directory: ${scanDir}`;
   if (partialOutput === true) output = `partial output remains at ${scanDir}`;
-  if (partialOutput === false) output = "no partial output was kept";
+  if (partialOutput === false)
+    output = `no scan output was found in ${scanDir}`;
   return `Scan stopped: short-context budget baseline ${formatUsd(cost.estimatedUsd)} exceeded the ${formatUsd(maxCostUsd)} limit; estimated cost ${formatScanCost(cost)}; ${output}.`;
 }

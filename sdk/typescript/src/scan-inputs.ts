@@ -8,7 +8,7 @@ import { workflowDigest } from "./finding-workflow.js";
 import type { KnowledgeBaseSnapshot } from "./knowledge-base.js";
 import { readRegularInputFile } from "./prompt-files.js";
 
-export const KNOWLEDGE_SNAPSHOT_FILE = ".scan-knowledge.json";
+const KNOWLEDGE_SNAPSHOT_FILE = ".scan-knowledge.json";
 
 const knowledgeSnapshotSchema = z.object({
   sources: z.array(z.string()),

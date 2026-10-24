@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { main } from "../src/cli.js";
 import { CodexSecurityError, ScanResult } from "../src/index.js";
@@ -281,11 +281,13 @@ test.each(["deleted", "empty", "populated"])(
       await mkdir(scanDir);
       const result = new ScanResult({ ...fakeResult(["high"]), scanDir });
       await writeFile(result.manifestPath, JSON.stringify(result.manifest));
+      await writeFile(join(scanDir, "validation.md"), "Previous report.");
       const stdout = capture();
       const stderr = capture();
       const signals = new FakeSignals();
       const failure = "Synthetic validation interruption.";
       let historyReads = 0;
+      let reportFilename = "";
       const exit = await main(
         ["scan", ".", "--validate", "--verbose", "--json", "--full-output"],
         stdout.stream,
@@ -295,6 +297,10 @@ test.each(["deleted", "empty", "populated"])(
           result,
           signals,
           onValidate: async () => {
+            reportFilename =
+              (await readdir(scanDir)).find((name) =>
+                name.startsWith("validation-"),
+              ) ?? "";
             signals.emit("SIGINT");
             throw new Error(failure);
           },
@@ -320,17 +326,21 @@ test.each(["deleted", "empty", "populated"])(
       );
       const message = `Validation interrupted. Run codex-security scans show ${result.manifest.scan.id} to inspect the completed scan.`;
       expect(exit).toBe(130);
+      expect(reportFilename).toMatch(/^validation-.+\.md$/);
       expectFailure(stdout.text(), true, "SCAN_FAILED", message, {
         ...result.toJSON(),
         validation: {
           status: "failed",
           findings: 0,
-          reportPath: join(scanDir, "validation.md"),
+          reportPath: join(scanDir, reportFilename),
           message: failure,
           exitCode: 130,
         },
       });
       expect(stderr.text()).toContain(message);
+      expect(stderr.text()).toContain(
+        `Validation report filename: ${reportFilename}\n`,
+      );
       expect(stderr.text()).not.toContain("Partial validation report:");
       expect(stderr.text()).not.toContain("partial_output=");
       expect(historyReads).toBe(0);

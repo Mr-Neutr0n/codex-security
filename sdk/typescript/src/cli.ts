@@ -200,11 +200,7 @@ import {
   type PreparedKnowledgeBase,
   type KnowledgeBaseSnapshot,
 } from "./knowledge-base.js";
-import {
-  KNOWLEDGE_SNAPSHOT_FILE,
-  restoreScanKnowledge,
-  scanInputIdentity,
-} from "./scan-inputs.js";
+import { restoreScanKnowledge, scanInputIdentity } from "./scan-inputs.js";
 import { workflowDigest } from "./finding-workflow.js";
 import {
   CodexSecurityError,
@@ -9036,17 +9032,18 @@ function incurErrorMessage(output: string): string {
   return typeof parsed === "string" ? parsed : message;
 }
 
-async function hasPartialOutput(path: string): Promise<boolean | undefined> {
+async function scanDirectoryIsEmpty(path: string): Promise<boolean> {
   try {
-    if (relative(path, await realpath(path)) !== "") return undefined;
-    for await (const entry of await opendir(path)) {
-      if (entry.name !== KNOWLEDGE_SNAPSHOT_FILE) return true;
+    if (relative(path, await realpath(path)) !== "") return false;
+    const directory = await opendir(path);
+    try {
+      return (await directory.read()) === null;
+    } finally {
+      await directory.close();
     }
-    return false;
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT" || code === "ENOTDIR") return false;
-    return undefined;
+    return code === "ENOENT" || code === "ENOTDIR";
   }
 }
 
@@ -9054,8 +9051,9 @@ function partialOutputMessage(
   scanDir: string | null,
   present: boolean | undefined,
 ): string {
-  if (scanDir === null || present === false)
-    return "No partial output was kept.";
+  if (scanDir === null) return "No partial output was kept.";
+  if (present === false)
+    return `No scan output was found in ${errorMessage(scanDir)}.`;
   return present
     ? `Partial output was kept at ${errorMessage(scanDir)}.`
     : `Output directory: ${errorMessage(scanDir)}`;
@@ -9956,6 +9954,11 @@ async function executeScan(
     const scanId = quoteCliPath(diagnosticValue(result.manifest.scan.id));
     const message = `Validation interrupted. Run codex-security scans show ${scanId} to inspect the completed scan.`;
     errorOutput.write(`codex-security: ${message}\n`);
+    const reportPath = validation?.["reportPath"];
+    if (typeof reportPath === "string")
+      errorOutput.write(
+        `Validation report filename: ${basename(reportPath)}\n`,
+      );
     return {
       exitCode,
       error: message,
@@ -9967,6 +9970,7 @@ async function executeScan(
   }
 
   let failureData: Record<string, unknown> | undefined;
+  let verifiedScanDir: string | undefined;
   if (
     arguments_.includeFailureResults &&
     (failed || requestedSignal !== null)
@@ -9981,6 +9985,7 @@ async function executeScan(
           pluginRoot: await bundledPluginRoot(),
           expectedScanId: registeredScan.scanId,
         });
+        verifiedScanDir = registeredScan.scanDir;
         failureData = {
           ...contract,
           scanDir: registeredScan.scanDir,
@@ -9995,10 +10000,17 @@ async function executeScan(
   const costLimitFailure =
     failure instanceof ScanCostLimitExceededError ? failure : undefined;
   const failedScanDir = costLimitFailure?.scanDir ?? scanDir;
+  let outputAtPath: boolean | undefined;
+  if (failed || requestedSignal !== null) {
+    if (failedScanDir === null) outputAtPath = false;
+    else if (failedScanDir === verifiedScanDir) outputAtPath = true;
+    else if (await scanDirectoryIsEmpty(failedScanDir)) outputAtPath = false;
+  }
+  // A registered scan may already have been archived under its saved ID.
   const partialOutput =
-    (failed || requestedSignal !== null) &&
-    failedScanDir !== null &&
-    (await hasPartialOutput(failedScanDir));
+    outputAtPath === false && registeredScan !== undefined
+      ? undefined
+      : outputAtPath;
 
   if (requestedSignal !== null) {
     diagnostic("scan.interrupted", {
@@ -10007,7 +10019,7 @@ async function executeScan(
     });
     const exitCode = interruptedExit(
       requestedSignal,
-      partialOutputMessage(failedScanDir, partialOutput),
+      partialOutputMessage(failedScanDir, outputAtPath),
       errorOutput,
     );
     printFailedScanReference(registeredScan, phase, arguments_, errorOutput);
@@ -10030,7 +10042,7 @@ async function executeScan(
                 costLimitFailure.maxCostUsd,
                 costLimitFailure.cost,
                 costLimitFailure.scanDir,
-                partialOutput,
+                outputAtPath,
               ),
             )
           : scanFailureMessage(
@@ -10056,11 +10068,10 @@ async function executeScan(
     errorOutput.write(`${message}\n`);
     if (
       costLimitFailure === undefined &&
-      (partialOutput === true ||
-        (partialOutput === undefined && registeredScan === undefined)) &&
-      scanDir !== null
+      scanDir !== null &&
+      (outputAtPath !== undefined || registeredScan === undefined)
     ) {
-      errorOutput.write(`${partialOutputMessage(scanDir, partialOutput)}\n`);
+      errorOutput.write(`${partialOutputMessage(scanDir, outputAtPath)}\n`);
     }
     printFailedScanReference(registeredScan, phase, arguments_, errorOutput);
     return { exitCode: 2, error: message, data: failureData };

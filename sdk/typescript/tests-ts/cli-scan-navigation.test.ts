@@ -4,6 +4,7 @@ import { describe, expect, test } from "bun:test";
 import { main } from "../src/cli.js";
 import type { JsonObject } from "../src/config.js";
 import { dependencies, fakeResult } from "./cli-fixtures.js";
+import { copyCompletedScan } from "./plugin-root.js";
 import { createCliTest } from "./support/cli-run.js";
 import { writeJsonLines } from "./support/json.js";
 import { temporaryDirectory } from "./support/temporary-directories.js";
@@ -149,6 +150,47 @@ describe("scan navigation", () => {
     expect(cli.stderr.text()).toContain(result.scanDir);
   });
 
+  test.each([true, false])(
+    "checks a saved full-output contract against the registered scan id (matching %s)",
+    async (matching) => {
+      const root = await temporaryDirectory("failed-scan-contract-");
+      try {
+        const scanDir = await copyCompletedScan(root);
+        const scanId = matching ? "scan_example_001" : latestId;
+        const cli = createCliTest(main);
+        const deps = dependencies({
+          onTurn: (_repository, options) => {
+            options.onOutputDirReady?.(scanDir);
+            options.onScanRegistered?.({ scanId, scanDir, startedAt });
+            throw new Error("Synthetic scan failure");
+          },
+        });
+        expect(
+          await cli.runCli(
+            ["scan", ".", "--json", "--full-output", "--verbose"],
+            deps,
+          ),
+        ).toBe(2);
+        expect(cli.stderr.text()).toContain(`scans show ${scanId}`);
+        if (matching) {
+          expect(JSON.parse(cli.stdout.text()).data.manifest.scan.id).toBe(
+            scanId,
+          );
+          expect(cli.stderr.text()).toContain("partial_output=true");
+          expect(cli.stderr.text()).toContain(
+            `Partial output was kept at ${scanDir}.`,
+          );
+        } else {
+          expect(JSON.parse(cli.stdout.text()).data).toBeUndefined();
+          expect(cli.stderr.text()).not.toContain("partial_output=");
+          expect(cli.stderr.text()).not.toContain("Partial output was kept");
+        }
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   test.each([
     { customPrompts: false, removeOutput: false },
     { customPrompts: true, removeOutput: false },
@@ -218,11 +260,9 @@ describe("scan navigation", () => {
           "Last observed phase: reviewing files",
         );
         expect(cli.stderr.text()).toContain(`Output directory: ${scanDir}`);
-        expect(cli.stderr.text()).toContain(`partial_output=${!removeOutput}`);
-        if (removeOutput) {
-          expect(cli.stderr.text()).not.toContain("Retained results");
-          expect(cli.stderr.text()).not.toContain("Partial output was kept");
-        }
+        expect(cli.stderr.text()).not.toContain("partial_output=");
+        expect(cli.stderr.text()).not.toContain("Retained results");
+        expect(cli.stderr.text()).not.toContain("Partial output was kept");
         expect(cli.stderr.text()).toContain(`scans show ${latestId}`);
         expect(cli.stderr.text()).toContain(`scans logs ${latestId}`);
         expect(cli.stderr.text()).toContain("Inspect the saved scan status");
