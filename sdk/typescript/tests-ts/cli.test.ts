@@ -47,6 +47,7 @@ import {
 } from "../src/cli.js";
 import { scanPreflightCodexConfig } from "../src/api.js";
 import { readKnowledgeBaseSnapshot } from "../src/knowledge-base.js";
+import { saveScanKnowledge } from "../src/scan-inputs.js";
 import { CODEX_EXECUTABLE_VERSION, CODEX_SDK_VERSION } from "../src/version.js";
 import {
   CHEAPERINFERENCE_CODEX_PROVIDER,
@@ -621,7 +622,7 @@ describe("CLI", () => {
           expect(output.ok).toBe(false);
           const message = validationFailed
             ? failureMessage
-            : `Validation interrupted. Scan output was kept at ${scanDir}.`;
+            : "Validation interrupted. Run codex-security scans show scan to inspect the completed scan.";
           expect(output.error).toEqual({ code: "SCAN_FAILED", message });
           expect(stderr.text()).toContain(message);
         }
@@ -5955,13 +5956,14 @@ describe("CLI", () => {
     }
   });
 
-  test.each(["empty", "missing", "file", "nonempty"] as const)(
+  test.each(["empty", "missing", "file", "knowledge", "nonempty"] as const)(
     "reports retained output accurately for %s directories across scan failures",
     async (state) => {
       const root = await temporaryDirectory("codex-security-partial-output-");
       try {
         for (const failureKind of [
           "ordinary",
+          "interrupted",
           "SIGINT",
           "SIGTERM",
           "cost",
@@ -5972,8 +5974,14 @@ describe("CLI", () => {
             "scan_sk-proj-SYNTHETIC_PATH_KEY_123",
           );
           await mkdir(scanDir, { recursive: true });
+          if (state === "knowledge" || state === "nonempty") {
+            await saveScanKnowledge(scanDir, {
+              sources: ["context.md"],
+              documents: { "context.md": "Synthetic guidance." },
+            });
+          }
           if (state === "nonempty")
-            await writeFile(join(scanDir, "progress.log"), "partial\n");
+            await writeFile(join(scanDir, "report.md"), "partial\n");
           const cost = fakeResult([], "complete", sampleUsage()).cost!;
           const signals = new FakeSignals();
           const { stdout, stderr, runCli } = createCliTest(main);
@@ -5988,6 +5996,11 @@ describe("CLI", () => {
               }
               if (failureKind === "SIGINT" || failureKind === "SIGTERM")
                 signals.emit(failureKind);
+              if (failureKind === "interrupted")
+                throw new ScanInterruptedError(
+                  "SYNTHETIC_SCAN_FAILURE",
+                  scanDir,
+                );
               throw failureKind === "cost"
                 ? new ScanCostLimitExceededError(0.004, cost, scanDir)
                 : new Error("SYNTHETIC_SCAN_FAILURE");
@@ -6023,7 +6036,7 @@ describe("CLI", () => {
             expect(stderr.text()).toContain(message);
           } else {
             expect(stdout.text()).toBe("");
-            if (failureKind === "ordinary")
+            if (failureKind === "ordinary" || failureKind === "interrupted")
               expect(stderr.text()).toContain("SYNTHETIC_SCAN_FAILURE");
             else {
               expect(stderr.text()).toContain(
@@ -6043,10 +6056,52 @@ describe("CLI", () => {
               expect(stderr.text()).not.toContain("Partial output was kept at");
           }
           if (partial)
-            expect(await readFile(join(scanDir, "progress.log"), "utf8")).toBe(
+            expect(await readFile(join(scanDir, "report.md"), "utf8")).toBe(
               "partial\n",
             );
         }
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.each(["scan directory", "parent directory"] as const)(
+    "does not report retained output from a redirected %s",
+    async (kind) => {
+      const root = await temporaryDirectory(
+        "codex-security-redirected-output-",
+      );
+      try {
+        const parent = join(root, "output");
+        const scanDir = join(parent, "scan");
+        const otherParent = join(root, "unrelated");
+        const otherScanDir = join(otherParent, "scan");
+        await mkdir(scanDir, { recursive: true });
+        await mkdir(otherScanDir, { recursive: true });
+        await writeFile(join(otherScanDir, "unrelated.txt"), "unrelated\n");
+        const deps = scanDependencies(async (_repository, options) => {
+          options?.onOutputDirReady?.(scanDir);
+          const link = kind === "scan directory" ? scanDir : parent;
+          const target = kind === "scan directory" ? otherScanDir : otherParent;
+          await rm(link, { recursive: true });
+          await symlink(
+            target,
+            link,
+            process.platform === "win32" ? "junction" : "dir",
+          );
+          throw new Error("SYNTHETIC_SCAN_FAILURE");
+        });
+        const { stdout, stderr, runCli } = createCliTest(main);
+        expect(await runCli(["scan", ".", "--json", "--verbose"], deps)).toBe(
+          2,
+        );
+        expect(JSON.parse(stdout.text()).message).toBe(
+          "SYNTHETIC_SCAN_FAILURE",
+        );
+        expect(stderr.text()).not.toContain("partial_output=");
+        expect(stderr.text()).not.toContain("Partial output was kept");
+        expect(stderr.text()).toContain(`Output directory: ${scanDir}`);
       } finally {
         await rm(root, { recursive: true, force: true });
       }
@@ -6062,7 +6117,9 @@ describe("CLI", () => {
     )
       return;
     const originalOpendir = opendir;
-    const scanDir = "/synthetic-partial-output";
+    const scanDir = await temporaryDirectory(
+      "codex-security-unreadable-output-",
+    );
     try {
       mockFs(() => ({
         opendir: async (path: string) => {
@@ -6085,6 +6142,7 @@ describe("CLI", () => {
       expect(stderr.text()).not.toContain("Cannot inspect output");
     } finally {
       restoreFs({ opendir: originalOpendir });
+      await rm(scanDir, { recursive: true, force: true });
     }
   });
 

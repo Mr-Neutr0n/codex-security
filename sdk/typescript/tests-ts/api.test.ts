@@ -5475,7 +5475,7 @@ describe("CodexSecurity orchestration", () => {
         else if (scenario === "canceled")
           await expect(scan).rejects.toMatchObject({
             name: ScanInterruptedError.name,
-            message: `Codex Security scan was interrupted; scan output directory: ${scanDir}.`,
+            message: `Codex Security scan was interrupted; output directory: ${scanDir}.`,
             scanDir,
           });
         else

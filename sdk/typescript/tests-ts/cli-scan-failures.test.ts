@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, rm, unlink, writeFile } from "node:fs/promises";
+import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { main } from "../src/cli.js";
 import { CodexSecurityError, ScanResult } from "../src/index.js";
@@ -270,45 +270,75 @@ test.each(commands)(
   },
 );
 
-test("reports empty output after an interrupted validation while returning the completed scan", async () => {
-  const root = await temporaryDirectory("validation-interrupt-");
-  try {
-    const repository = join(root, "repository");
-    const scanDir = join(root, "scan");
-    await mkdir(repository);
-    await mkdir(scanDir);
-    const result = new ScanResult({ ...fakeResult(), scanDir });
-    await writeFile(result.manifestPath, JSON.stringify(result.manifest));
-    const stdout = capture();
-    const stderr = capture();
-    const signals = new FakeSignals();
-    const exit = await main(
-      ["scan", ".", "--validate", "--verbose", "--json", "--full-output"],
-      stdout.stream,
-      stderr.stream,
-      dependencies({
-        currentDirectory: repository,
-        result,
-        signals,
-        onWorkbench: () => {
-          signals.emit("SIGINT");
-          return { scan: { targetPath: repository } };
+test.each(["deleted", "empty", "populated"])(
+  "identifies the completed scan when validation is interrupted and its original output is %s",
+  async (replacement) => {
+    const root = await temporaryDirectory("validation-interrupt-");
+    try {
+      const repository = join(root, "repository");
+      const scanDir = join(root, "scan");
+      await mkdir(repository);
+      await mkdir(scanDir);
+      const result = new ScanResult({ ...fakeResult(["high"]), scanDir });
+      await writeFile(result.manifestPath, JSON.stringify(result.manifest));
+      const stdout = capture();
+      const stderr = capture();
+      const signals = new FakeSignals();
+      const failure = "Synthetic validation interruption.";
+      let historyReads = 0;
+      const exit = await main(
+        ["scan", ".", "--validate", "--verbose", "--json", "--full-output"],
+        stdout.stream,
+        stderr.stream,
+        dependencies({
+          currentDirectory: repository,
+          result,
+          signals,
+          onValidate: async () => {
+            signals.emit("SIGINT");
+            throw new Error(failure);
+          },
+          onWorkbench: () => {
+            historyReads++;
+            return {};
+          },
+          onClose: async () => {
+            if (replacement === "deleted") {
+              await rm(scanDir, { recursive: true });
+              return;
+            }
+            await rename(scanDir, join(root, "scan.previous-test"));
+            await mkdir(scanDir);
+            if (replacement === "populated") {
+              await writeFile(
+                result.manifestPath,
+                JSON.stringify({ scan: { id: "replacement-scan" } }),
+              );
+            }
+          },
+        }),
+      );
+      const message = `Validation interrupted. Run codex-security scans show ${result.manifest.scan.id} to inspect the completed scan.`;
+      expect(exit).toBe(130);
+      expectFailure(stdout.text(), true, "SCAN_FAILED", message, {
+        ...result.toJSON(),
+        validation: {
+          status: "failed",
+          findings: 0,
+          reportPath: join(scanDir, "validation.md"),
+          message: failure,
+          exitCode: 130,
         },
-        onClose: () => unlink(result.manifestPath),
-      }),
-    );
-    const message = "Validation interrupted. No scan output was kept.";
-    expect(exit).toBe(130);
-    expectFailure(stdout.text(), true, "SCAN_FAILED", message, {
-      ...result.toJSON(),
-      validation: { status: "failed", findings: 0, exitCode: 130 },
-    });
-    expect(stderr.text()).toContain(message);
-    expect(stderr.text()).toContain("partial_output=false");
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
+      });
+      expect(stderr.text()).toContain(message);
+      expect(stderr.text()).not.toContain("Partial validation report:");
+      expect(stderr.text()).not.toContain("partial_output=");
+      expect(historyReads).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test("retains diagnostics when the latest-scan working directory is unavailable", async () => {
   for (const flags of [[], ["--json"], ["--json", "--full-output"]]) {

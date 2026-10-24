@@ -200,7 +200,11 @@ import {
   type PreparedKnowledgeBase,
   type KnowledgeBaseSnapshot,
 } from "./knowledge-base.js";
-import { restoreScanKnowledge, scanInputIdentity } from "./scan-inputs.js";
+import {
+  KNOWLEDGE_SNAPSHOT_FILE,
+  restoreScanKnowledge,
+  scanInputIdentity,
+} from "./scan-inputs.js";
 import { workflowDigest } from "./finding-workflow.js";
 import {
   CodexSecurityError,
@@ -215,7 +219,6 @@ import {
   errorMessage,
   scanCostLimitFailureMessage,
   ScanCostLimitExceededError,
-  ScanInterruptedError,
 } from "./errors.js";
 import {
   GITHUB_ADVISORY_STATES,
@@ -9035,7 +9038,10 @@ function incurErrorMessage(output: string): string {
 
 async function hasPartialOutput(path: string): Promise<boolean | undefined> {
   try {
-    for await (const _entry of await opendir(path)) return true;
+    if (relative(path, await realpath(path)) !== "") return undefined;
+    for await (const entry of await opendir(path)) {
+      if (entry.name !== KNOWLEDGE_SNAPSHOT_FILE) return true;
+    }
     return false;
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
@@ -9909,7 +9915,10 @@ async function executeScan(
             errorOutput.write(
               `codex-security: Validation failed: ${diagnosticValue(message)}\n`,
             );
-            if (validation["reportPath"] !== undefined) {
+            if (
+              requestedSignal === null &&
+              validation["reportPath"] !== undefined
+            ) {
               errorOutput.write(
                 `Partial validation report: ${diagnosticValue(validation["reportPath"])}\n`,
               );
@@ -9939,6 +9948,22 @@ async function executeScan(
       );
     }
     removeSignalListeners();
+  }
+
+  if (requestedSignal !== null && result !== null && arguments_.validate) {
+    diagnostic("scan.interrupted", { signal: requestedSignal });
+    const exitCode = requestedSignal === "SIGINT" ? 130 : 143;
+    const scanId = quoteCliPath(diagnosticValue(result.manifest.scan.id));
+    const message = `Validation interrupted. Run codex-security scans show ${scanId} to inspect the completed scan.`;
+    errorOutput.write(`codex-security: ${message}\n`);
+    return {
+      exitCode,
+      error: message,
+      data: {
+        ...result.toJSON(),
+        validation: { ...validation, status: "failed", exitCode },
+      },
+    };
   }
 
   let failureData: Record<string, unknown> | undefined;
@@ -9980,25 +10005,6 @@ async function executeScan(
       signal: requestedSignal,
       partial_output: partialOutput,
     });
-    if (result !== null && arguments_.validate) {
-      const exitCode = requestedSignal === "SIGINT" ? 130 : 143;
-      const note =
-        partialOutput === false
-          ? "No scan output was kept."
-          : partialOutput
-            ? `Scan output was kept at ${errorMessage(result.scanDir)}.`
-            : `Output directory: ${errorMessage(result.scanDir)}`;
-      const message = `Validation interrupted. ${note}`;
-      errorOutput.write(`codex-security: ${message}\n`);
-      return {
-        exitCode,
-        error: message,
-        data: {
-          ...result.toJSON(),
-          validation: { ...validation, status: "failed", exitCode },
-        },
-      };
-    }
     const exitCode = interruptedExit(
       requestedSignal,
       partialOutputMessage(failedScanDir, partialOutput),
@@ -10049,7 +10055,7 @@ async function executeScan(
     });
     errorOutput.write(`${message}\n`);
     if (
-      !(failure instanceof ScanInterruptedError) &&
+      costLimitFailure === undefined &&
       (partialOutput === true ||
         (partialOutput === undefined && registeredScan === undefined)) &&
       scanDir !== null
