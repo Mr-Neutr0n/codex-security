@@ -1,5 +1,6 @@
 import { describe, expect, test, mock } from "bun:test";
 import { main } from "../src/cli.js";
+import { ScanInterruptedError } from "../src/errors.js";
 import {
   FakeSignals,
   capture,
@@ -52,7 +53,34 @@ describe("CLI signals", () => {
     expect(await runCli(["scan", "."], deps)).toBe(130);
     expect(stdout.text()).toBe("");
     expect(stderr.text()).toContain("Scan canceled by Ctrl-C.");
-    expect(stderr.text()).toContain("No output directory was reported.");
+    expect(stderr.text()).not.toMatch(/output directory|partial output/i);
+  });
+
+  test("uses the SDK output directory when archive registration is interrupted", async () => {
+    const { stdout, stderr, runCli } = createCliTest(main);
+    const scanDir = "/tmp/pending-registration";
+    const signals = new FakeSignals();
+    const deps = dependencies({ signals });
+    deps.createSecurity = () =>
+      fakeSecurity(async () => {
+        signals.emit("SIGINT");
+        throw new ScanInterruptedError("Scan interrupted", scanDir);
+      });
+    expect(
+      await runCli(
+        [
+          "scan",
+          ".",
+          "--archive-existing",
+          "--output-dir",
+          "pending-registration",
+        ],
+        deps,
+      ),
+    ).toBe(130);
+    expect(stdout.text()).toBe("");
+    expect(stderr.text()).toContain(`Output directory: ${scanDir}`);
+    expect(stderr.text()).not.toContain("scans show");
   });
 
   test("preserves signals received during client cleanup", async () => {

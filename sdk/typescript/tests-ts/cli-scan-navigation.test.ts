@@ -212,6 +212,7 @@ describe("scan navigation", () => {
         expect(cli.stderr.text()).toContain(`Output directory: ${scanDir}`);
         expect(cli.stderr.text()).not.toContain("partial_output=");
         expect(cli.stderr.text()).not.toContain("Partial output was kept");
+        expect(cli.stderr.text()).not.toContain("Retained results:");
         expect(cli.stderr.text()).toContain(`scans show ${latestId}`);
         expect(cli.stderr.text()).toContain(`scans logs ${latestId}`);
         expect(cli.stderr.text()).toContain("Inspect the saved scan status");
