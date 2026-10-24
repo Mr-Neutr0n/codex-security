@@ -12,8 +12,12 @@ import {
 import { randomUUID } from "node:crypto";
 import {
   chmodSync,
+  close as closeCallback,
   constants,
   createWriteStream,
+  fstat as fstatCallback,
+  open as openCallback,
+  read as readCallback,
   type BigIntStats,
   type Stats,
 } from "node:fs";
@@ -54,7 +58,7 @@ import { promisify } from "node:util";
 import { pipeline } from "node:stream/promises";
 import { crc32 } from "node:zlib";
 import { setTimeout as delay } from "node:timers/promises";
-import { openPromise as openZip } from "yauzl";
+import { fromFdPromise, type ZipFile } from "yauzl";
 import { parse } from "smol-toml";
 import {
   CodexSecurityError,
@@ -120,7 +124,6 @@ const CREDENTIAL_LOCK_HEARTBEAT_MILLISECONDS = 5_000;
 const CREDENTIAL_LOCK_POLL_MILLISECONDS = 25;
 const INCOMPLETE_CREDENTIAL_LOCK_MILLISECONDS = 30_000;
 const MAX_PROCESS_ID = 2_147_483_647;
-const MAX_WINDOWS_CREDENTIAL_ACL_STDERR = 64 * 1024;
 const SANDBOX_PROBE_TIMEOUT_MILLISECONDS = 10_000;
 const PLUGIN_HELPER_SECRET_ENVIRONMENT_VARIABLES = new Set([
   "OPENAI_API_KEY",
@@ -723,8 +726,7 @@ export async function streamWindowsCredentialAclDescriptors(
   let stderr = "";
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk: string) => {
-    const remaining = MAX_WINDOWS_CREDENTIAL_ACL_STDERR - stderr.length;
-    if (remaining > 0) stderr += chunk.slice(0, remaining);
+    stderr += chunk;
   });
 
   let descendantsChanged = false;
@@ -1631,6 +1633,8 @@ export async function runWorkbench(
       "database-info",
       "store-findings",
       "list-stored-findings",
+      "store-external-findings",
+      "list-external-findings",
       "find-potential-duplicates",
       "store-dedupe-groups",
       "list-dedupe-groups",
@@ -1663,9 +1667,8 @@ export async function runWorkbench(
       ? (options.stateDirectory ??
         codexSecurityStateDirectory(options.environment))
       : undefined;
-    // OS argv cannot carry NUL, but workbench text fields can.
-    const framedArguments =
-      !native && arguments_.some((argument) => argument.includes("\0"));
+    // Workbench text fields can contain NUL or exceed OS command-line limits.
+    const framedArguments = !native;
     let program = archiveHandshake ? ARCHIVE_REGISTRATION_PROGRAM : undefined;
     if (framedArguments)
       program =
@@ -2092,7 +2095,7 @@ async function prepareOutputDirectory(
   }
 }
 
-async function createWindowsOutputDirectory(
+export async function createWindowsOutputDirectory(
   path: string,
   recursive: boolean,
 ): Promise<string | undefined> {
@@ -2353,11 +2356,10 @@ export async function extractPluginZip(
   );
   try {
     throwIfSignalAborted(signal);
-    await rejectBackslashZipNames(archivePath, signal);
     let expandedSize = 0;
     const paths = new Set<string>();
     const checksums: Array<{ path: string; checksum: number }> = [];
-    const zip = await openZip(archivePath, { strictFileNames: true });
+    const zip = await openPluginZip(archivePath, signal);
     try {
       for await (const entry of zip.eachEntry()) {
         throwIfSignalAborted(signal);
@@ -2440,19 +2442,23 @@ export async function extractPluginZip(
   }
 }
 
-async function rejectBackslashZipNames(
+async function openPluginZip(
   path: string,
   signal?: AbortSignal,
-): Promise<void> {
-  const handle = await open(path, "r");
+): Promise<ZipFile> {
+  const fd = await promisify(openCallback)(
+    path,
+    constants.O_RDONLY |
+      (process.platform === "win32" ? 0 : constants.O_NONBLOCK),
+  );
   try {
-    const metadata = await handle.stat();
+    const metadata = await promisify(fstatCallback)(fd);
     if (!metadata.isFile() || metadata.size < 22) {
       throw new Error("missing end of central directory");
     }
     const tailSize = Math.min(metadata.size, 65_557);
     const tail = await readExactly(
-      handle,
+      fd,
       tailSize,
       metadata.size - tailSize,
       signal,
@@ -2490,12 +2496,7 @@ async function rejectBackslashZipNames(
     if (centralOffset + centralSize > endOffset) {
       throw new Error("invalid central directory bounds");
     }
-    const central = await readExactly(
-      handle,
-      centralSize,
-      centralOffset,
-      signal,
-    );
+    const central = await readExactly(fd, centralSize, centralOffset, signal);
     let offset = 0;
     for (let index = 0; index < entries; index += 1) {
       if (
@@ -2522,8 +2523,14 @@ async function rejectBackslashZipNames(
     if (offset !== central.byteLength) {
       throw new Error("invalid central directory size");
     }
-  } finally {
-    await handle.close();
+    // Yauzl owns the descriptor only after construction succeeds.
+    return await fromFdPromise(fd, {
+      autoClose: true,
+      strictFileNames: true,
+    });
+  } catch (error) {
+    await promisify(closeCallback)(fd);
+    throw error;
   }
 }
 
@@ -3401,7 +3408,7 @@ async function copyPluginTree(
 }
 
 async function readExactly(
-  handle: Awaited<ReturnType<typeof open>>,
+  fd: number,
   length: number,
   position: number,
   signal?: AbortSignal,
@@ -3410,7 +3417,8 @@ async function readExactly(
   let offset = 0;
   while (offset < length) {
     throwIfSignalAborted(signal);
-    const { bytesRead } = await handle.read(
+    const { bytesRead } = await promisify(readCallback)(
+      fd,
       buffer,
       offset,
       length - offset,

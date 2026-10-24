@@ -5,6 +5,26 @@ export type {
 } from "./artifact-export.js";
 export { CodexSecurity, createSecurity } from "./api.js";
 export {
+  runHostedRemediation,
+  HostedRemediationInputSchema,
+  HostedRemediationPreparationError,
+} from "./hosted-remediation.js";
+export type {
+  HostedRemediationInput,
+  HostedRemediationOptions,
+  HostedRemediationResult,
+  RemediationExecutor,
+  RemediationExecutionRequest,
+  RemediationExecutionResult,
+  RemediationExecutionEvent,
+} from "./hosted-remediation.js";
+export { runHostedRemediationProtocol } from "./hosted-remediation-protocol.js";
+export type {
+  FindingPatch,
+  FindingVerification,
+  FindingVerificationCheck,
+} from "./remediation.js";
+export {
   runHostedScan,
   HostedScanInputSchema,
   HostedScanPreparationError,
@@ -31,7 +51,7 @@ export type {
 } from "./project-config-schema.js";
 export type { ScanSettings } from "./scan-settings.js";
 export { classifySeverity } from "./classify-severity.js";
-export { suggestOwners } from "./suggest-owners.js";
+export { suggestOwners, suggestOwnersFromScan } from "./suggest-owners.js";
 export type {
   OwnerFinding,
   CodeownerIdentity,
@@ -182,6 +202,54 @@ export type {
   DeduplicationDiagnosticObserver,
 } from "./deduplication/diagnostics.js";
 export type { FindingEmbedder } from "./server/embeddings.js";
+export {
+  ExternalPublicationError,
+  prepareExternalPublication,
+  prepareNormalizedExternalPublication,
+} from "./external-findings-publish.js";
+export type {
+  ExternalPublicationOptions,
+  NormalizedExternalPublicationOptions,
+  ExternalPublicationDependencies,
+  ExternalPublicationPreview,
+  ExternalPublicationProgress,
+  ExternalPublicationResult,
+  PreparedExternalPublication,
+} from "./external-findings-publish.js";
+export {
+  prepareNormalizedLocalImport,
+  listLocalExternalFindings,
+} from "./external-findings-local.js";
+export type {
+  StoredExternalFinding,
+  NormalizedLocalImportOptions,
+  LocalExternalImportDependencies,
+  LocalExternalImportPreview,
+  LocalExternalImportResult,
+  PreparedLocalExternalImport,
+} from "./external-findings-local.js";
+export type {
+  ExternalFinding,
+  ExternalFindings,
+  ExternalSourceRepository,
+} from "./external-findings.js";
+export type {
+  ExternalFindingEvidence,
+  FindingImportRequest,
+  FindingImportReceipt,
+  ImportRepository,
+  SourceReport,
+} from "./external-import-models.js";
+export {
+  normalizeGitHubCodeScanningAlerts,
+  normalizeGitHubAdvisories,
+  readGitHubFindings,
+} from "./github-findings.js";
+export { importGitHubAdvisories } from "./github-advisories.js";
+export type {
+  GitHubAdvisoryImportOptions,
+  ImportedGitHubAdvisory,
+} from "./github-advisories.js";
 export { importGitHubCodeScanningAlerts } from "./github.js";
 export type {
   GitHubCodeScanningImportOptions,
@@ -252,3 +320,22 @@ export type {
   ValidateRecordsOptions,
   ValidationReviewRequest,
 } from "./validation-records.js";
+
+export { prepareLocalExternalImport } from "./external-findings-import.js";
+export {
+  normalizeSnykFindingsExport,
+  normalizeSnykJson,
+  normalizeSnykSarif,
+  readSnykFindings,
+} from "./snyk-findings.js";
+export {
+  normalizeSemgrepFindings,
+  normalizeSemgrepSarif,
+  readSemgrepFindings,
+  type SemgrepImportOptions,
+} from "./semgrep-findings.js";
+export {
+  normalizeEndorFindings,
+  normalizeEndorSarif,
+  readEndorFindings,
+} from "./endor-findings.js";

@@ -2,7 +2,8 @@
 
 [GitHub Releases](https://github.com/openai/codex-security/releases) is the
 canonical changelog. Under the current process, each new release combines a
-short, reviewed summary with a categorized list of merged pull requests.
+short, reviewed summary with an expandable categorized list of merged pull
+requests.
 Historical releases may contain generated notes only. The release tag and npm
 package use the same stable version: `npm-vX.Y.Z` and
 `@openai/codex-security@X.Y.Z`. Releases whose source includes the GitHub Action
@@ -159,6 +160,28 @@ drafts highlights from merged titles and lists marked breaking changes for
 migration review; it does not infer migration instructions from source code.
 Review and refine these suggestions before releasing.
 
+Keep the published notes easy to scan:
+
+- Start with a short overview and the main user-facing highlights. Use bold
+  topic labels to make the bullets easy to skim. Put secondary improvements
+  in a `<details>` block when they would crowd out upgrade guidance.
+- Keep breaking changes and required upgrade actions visible. Long migration
+  procedures can go in a clearly named `<details>` block under the relevant
+  upgrade note. Keep code fences, tables, and lists intact.
+- Keep each prose paragraph or list item on one source line. GitHub Releases
+  renders source newlines as visible breaks, including those before links.
+  The release-note Prettier override uses `proseWrap: "never"`, and the SDK
+  format check includes this file.
+- Leave the complete PR inventory to the publisher. It appends the generated
+  notes, contributor credits, and comparison link in an **All changes**
+  disclosure after the reviewed summary. Releases without a reviewed summary
+  keep their generated notes visible.
+
+Preview both the release list and the individual release in GitHub. Check
+paragraph flow, inline links, tables, code examples, and expanded details.
+Edits to an already published release do not change its immutable tagged
+source; rerunning publication uses that tagged summary again.
+
 - Edit the highlights or upgrade notes on the release PR branch. Keep the
   surrounding `release-section` comments if you want to retain section
   boundaries. The bot refreshes a section only while it matches the last
@@ -249,7 +272,10 @@ for that exact commit:
 1. `node-release-cut` verifies that the version increased, checks the reviewed
    summary, and creates the exact `npm-vX.Y.Z` tag.
 2. `node-release` installs the committed dependency graph, tests and packs the
-   package, publishes it to npm, and records npm provenance.
+   package, publishes it to npm, and records npm provenance. Three TypeScript
+   test shards and the MCP tests run in parallel with package verification.
+   Every shard and package check must pass before the protected npm job can
+   publish the verified archive.
 3. `node-github-release` verifies the public package, provenance, tag, and
    archive before publishing the GitHub release. It prepends the reviewed
    summary to GitHub's categorized notes.
@@ -290,6 +316,31 @@ registry errors fail immediately.
 `plugins/codex-security/` during `prepack`. The generated
 `sdk/typescript/_bundled_plugin/` directory is not a committed release input;
 do not prepare a release by editing or committing files there.
+
+The merged release PR receives one progress comment covering post-merge CI,
+release verification, protected npm approval, public-package provenance,
+installation checks, Action publication, and container approval and publication.
+It links to the relevant workflow
+runs and updates at workflow boundaries. Each automatic release dispatch starts
+a separate observer using the returned run ID; this does not depend on chained
+`workflow_run` events from the built-in token. The observer checks release jobs
+every 30 seconds, including while protected approval is pending, and requests a refresh
+when a milestone changes. Reruns update the same comment using their latest
+results. Queued duplicates keep the active run and its approval link visible.
+Historical stages without a recorded run are marked **Not recorded**. Completion
+covers the automated workflows; Marketplace publication remains a separate step.
+
+Observers are subject to GitHub's job time limit. To resume observation after a
+long approval wait, run `release-progress` on `main` with the release `run-id`
+and `watch` enabled. GitHub publication starts its own observer after npm succeeds.
+
+The observer and comment writer execute only helpers from protected `main`.
+Only the comment writer can update PR comments, and only the observer can request
+a refresh. Both run outside the publication workflows. Verification and
+publication jobs retain their existing permissions. The dispatch jobs use their
+existing Actions permission for a best-effort notification bounded to 15 seconds,
+within the downstream resolver's 60-second completion wait. Progress-reporting
+failures do not block publication; workflow results remain authoritative.
 
 Monitor all three workflows and the final status in `node-github-release`.
 The automated release is complete when npm and GitHub publication, exact-version

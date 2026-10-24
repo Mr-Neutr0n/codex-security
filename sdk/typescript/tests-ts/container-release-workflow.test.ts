@@ -33,7 +33,13 @@ function workflow(name: string) {
       new URL(`../../../.github/workflows/${name}.yml`, import.meta.url),
       "utf8",
     ),
-  ) as { jobs: Record<string, Job> };
+  ) as {
+    concurrency?: {
+      group: string;
+      queue?: string;
+    };
+    jobs: Record<string, Job>;
+  };
 }
 const release = workflow("container-release");
 const directories: string[] = [];
@@ -178,6 +184,7 @@ test("coordinates publication, approval, and completion with the verified npm so
       contents: "read",
       packages: "write",
       attestations: "write",
+      "artifact-metadata": "write",
       "id-token": "write",
     },
   });
@@ -189,6 +196,13 @@ test("coordinates publication, approval, and completion with the verified npm so
   });
   expect(release.jobs["publish-platform"]?.needs).toBe("authorize");
   expect(release.jobs["promote"]?.needs).toContain("attest");
+  expect(release.jobs["attest"]?.permissions?.["artifact-metadata"]).toBe(
+    "write",
+  );
+  expect(release.concurrency).toEqual({
+    group: "container-release-publish",
+    queue: "max",
+  });
 });
 
 test("builds and downloads native payloads from the same source as the image", () => {
@@ -209,12 +223,16 @@ test("builds and downloads native payloads from the same source as the image", (
       "${{ inputs.ref || github.sha }}",
     );
   }
-  expect(native.jobs["bundle"]!.steps![0]?.with?.["pattern"]).toBe(
-    "native-platform-*-${{ inputs.ref || github.sha }}",
-  );
-  expect(native.jobs["bundle"]!.steps![1]?.with?.["name"]).toBe(
-    "native-universal-${{ inputs.ref || github.sha }}",
-  );
+  expect(
+    native.jobs["bundle"]!.steps!.find(
+      (step) => step.name === "Download verified platform payloads",
+    )?.with?.["pattern"],
+  ).toBe("native-platform-*-${{ inputs.ref || github.sha }}");
+  expect(
+    native.jobs["bundle"]!.steps!.find(
+      (step) => step.name === "Upload universal native payload",
+    )?.with?.["name"],
+  ).toBe("native-universal-${{ inputs.ref || github.sha }}");
   for (const job of ["publish-platform", "manifest"]) {
     expect(release.jobs[job]!.steps![0]?.with?.["ref"]).toBe(
       "${{ needs.authorize.outputs.sha }}",

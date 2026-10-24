@@ -1,3 +1,4 @@
+import { testArtifactStartupTimeoutClassification } from "./deep_scan_startup_cases.ts";
 import { windowsAcl } from "./support/windows-output-fixture.ts";
 import {
   createFakeCodexFixture,
@@ -10,9 +11,13 @@ import { readJson, writeJson } from "./support/json.ts";
 import { randomUUID } from "node:crypto";
 import { loadWorkbenchProcess } from "./support/workbench-process.ts";
 import { finding, workerDraft } from "./scan-draft-fixture.ts";
-import { assertFlagPair } from "./assertions.ts";
+import {
+  assertConfigOverrides,
+  assertFlagPair,
+  nativeConfigOverrides,
+} from "./assertions.ts";
 import { createTemporaryDirectories } from "./support/temporary-directories.ts";
-import { mock } from "node:test";
+import { mock, test, type TestContext } from "node:test";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import assert from "node:assert/strict";
 import childProcess, {
@@ -48,16 +53,19 @@ import { workerTelemetryFixture } from "./deep_scan_worker_telemetry_fixture.ts"
 import { testWorkerCyberAccessSettings } from "./deep_scan_worker_settings_cases.ts";
 
 const executorSource = new URL("../src/deep-scan/executor.ts", import.meta.url);
-const { bundledCodexSdkEnvironment } = await importModule({
-  entryPoints: [
-    fileURLToPath(
-      new URL(
-        "../../../../sdk/typescript/src/codex-sdk-environment.ts",
-        import.meta.url,
-      ),
-    ),
-  ],
-});
+const { bundledCodexSdkEnvironment } =
+  process.platform === "win32"
+    ? {}
+    : await importModule({
+        entryPoints: [
+          fileURLToPath(
+            new URL(
+              "../../../../sdk/typescript/src/codex-sdk-environment.ts",
+              import.meta.url,
+            ),
+          ),
+        ],
+      });
 
 const {
   CodexSdkWorkerExecutor,
@@ -95,67 +103,154 @@ const ipcFrameError =
   "code-mode delegate response exceeds the IPC frame limit: code-mode IPC frame length 76008279 exceeds 67108864 bytes";
 
 try {
-  testCodeModeFrameDiagnosticBoundaries();
-  await testLargeScopeTransport();
-  await testOpenAiCredentialsReachWorker();
-  await testWorkerCancellation();
-  testUsageLimitClassification();
-  await testWorkerTerminalEvents();
-  await testWorkerRuntimeSettings();
-  await testUnsupportedProviderSnapshotFailsBeforeLaunch();
-  await testWorkerCyberAccessSettings({
-    CodexSdkWorkerExecutor,
-    fakeCodexFixture,
-    parentSandbox: trustedParentSandbox,
-    workerRequest,
-    assertConfigOverrides,
-    assertReadOnlyWorkerPolicy,
-    assertWorkerSubagentPolicy,
-    restoreEnv,
-  });
-  await testCompletedWorkerSettlesWithoutWaitingForProcessExit();
-  if (process.platform !== "win32") {
-    await testDeepScanContextSnapshots({
-      CodexSdkWorkerExecutor,
-      fakeCodexFixture,
-      parentSandbox: trustedParentSandbox,
-    });
-    await testMissingParentSandboxFailsBeforeWorkerLaunch();
-    await testDisallowedWorkerProfileFailsBeforeWorkerLaunch();
-    await testRuntimePermissionProfileFallbackStopsAndDiscards();
-    await testWorkerLaunchesWithoutGlobalCodex();
-    await testPreflightBindsExecutableAndHomeBeforeChangingCwd();
-    await testConcurrentWorkerExecutableAliases({
-      CodexSdkWorkerExecutor,
-      fakeCodexFixture,
-      parentSandbox: trustedParentSandbox,
-      bundledCodexSdkEnvironment,
-      assertConfigOverrides,
-      assertReadOnlyWorkerPolicy,
-    });
-    await testSdkInvocationAndThreadCapture();
-    await testBedrockCredentialsReachWorker();
-    await testBedrockCredentialsReachWorker("oidc");
-    await testExternalProviderCredentialsReachWorker();
-    await testArtifactServerUsesExtendedStartupTimeout();
-    await testZeroSubagentsPreservesHostRestrictions();
-    await testSdkResumesExistingThread();
-    await testRetryNotificationDoesNotInterruptTurn();
-    await testSandboxNamespaceDiagnosticIsPreserved();
-    await testOwnedArtifactToolFailureDiagnosticIsPreserved();
-    for (const reference of ["discovery:\0" + "0", "😀".repeat(1300)]) {
-      await testArtifactDiagnosticSurvivesWorkerRetries(reference);
+  await test("Deep worker lifecycle", async (t) => {
+    await check(t, testWorkerCancellation);
+    await check(t, testWorkerTerminalEvents);
+    await check(t, testCompletedWorkerSettlesWithoutWaitingForProcessExit);
+    if (process.platform !== "win32") {
+      await check(t, testStreamTerminationWithoutTerminalEventFails);
+      await check(t, testAbortPropagation);
     }
-    await testCodeModeFrameDiagnosticSurvivesSuccessfulTurn();
-    await testStreamTerminationWithoutTerminalEventFails();
-    await testAbortPropagation();
-    await testUnstructuredConfigurationFailureRemainsRetryable();
-    await testUnstructuredThreadStartFailureRemainsRetryable();
-    await testPolicyFailuresRemainWorkerErrors();
-    await testMalformedCommandEventsRemainRetryable();
-    await testRateLimitPolicyFailureRemainsRetryable();
-    await testArtifactStartupTimeoutClassification();
-  }
+  });
+
+  await test("Deep worker runtime settings", async (t) => {
+    await check(t, testLargeScopeTransport);
+    await check(t, testOpenAiCredentialsReachWorker);
+    await check(t, testWorkerRuntimeSettings);
+    await check(t, testUnsupportedProviderSnapshotFailsBeforeLaunch);
+    await check(
+      t,
+      () =>
+        testWorkerCyberAccessSettings({
+          CodexSdkWorkerExecutor,
+          fakeCodexFixture,
+          parentSandbox: trustedParentSandbox,
+          workerRequest,
+          assertConfigOverrides,
+          assertReadOnlyWorkerPolicy,
+          assertWorkerSubagentPolicy,
+          restoreEnv,
+        }),
+      "cyber access settings",
+    );
+    if (process.platform !== "win32") {
+      await check(
+        t,
+        () =>
+          testDeepScanContextSnapshots({
+            CodexSdkWorkerExecutor,
+            fakeCodexFixture,
+            parentSandbox: trustedParentSandbox,
+          }),
+        "isolated context snapshots",
+      );
+      await check(t, testMissingParentSandboxFailsBeforeWorkerLaunch);
+      await check(t, testDisallowedWorkerProfileFailsBeforeWorkerLaunch);
+      await check(t, testRuntimePermissionProfileFallbackStopsAndDiscards);
+      await check(t, testSdkInvocationAndThreadCapture);
+      await check(
+        t,
+        () => testBedrockCredentialsReachWorker(),
+        "Bedrock credentials",
+      );
+      await check(
+        t,
+        () => testBedrockCredentialsReachWorker("oidc"),
+        "Bedrock OIDC credentials",
+      );
+      await check(t, testExternalProviderCredentialsReachWorker);
+      await check(t, testArtifactServerUsesExtendedStartupTimeout);
+      await check(t, testReducerAttemptContext);
+      await check(t, testZeroSubagentsPreservesHostRestrictions);
+      await check(t, testSdkResumesExistingThread);
+    }
+  });
+
+  await test("Deep worker executable selection", async (t) => {
+    await check(t, testConfiguredExecutablePaths);
+    if (process.platform !== "win32") {
+      await check(t, testWorkerLaunchesWithoutGlobalCodex);
+      await check(t, testPreflightBindsExecutableAndHomeBeforeChangingCwd);
+      await check(
+        t,
+        () =>
+          testConcurrentWorkerExecutableAliases({
+            CodexSdkWorkerExecutor,
+            fakeCodexFixture,
+            parentSandbox: trustedParentSandbox,
+            bundledCodexSdkEnvironment,
+            assertReadOnlyWorkerPolicy,
+          }),
+        "concurrent executable aliases",
+      );
+    }
+    await check(t, testWindowsAppsCodexFallsBackToRelocatedBinary);
+    await check(
+      t,
+      () => testWindowsNpmPackageResolution(),
+      "global Windows npm package resolution",
+    );
+    await check(
+      t,
+      () => testWindowsNpmPackageResolution("managed"),
+      "managed Windows npm package resolution",
+    );
+    if (process.platform === "win32") {
+      await check(t, testWindowsLongExecutableLaunches);
+      await check(t, testWindowsRootRelativePathsStayBoundToOriginalDrive);
+      await check(t, testWindowsWorkerEnvironmentPreservesMixedCaseKeys);
+      await check(t, testWindowsLauncherSkipsExtensionlessNpmShim);
+    }
+  });
+
+  await test("Deep worker diagnostics", async (t) => {
+    await check(t, testCodeModeFrameDiagnosticBoundaries);
+    await check(t, testUsageLimitClassification);
+    await check(t, testOsErrorCodesRemainRetryable);
+    await check(t, testTextualMissingPathErrorsRemainRetryable);
+    await check(t, testWorkerErrorClassificationPreservesExplicitFailures);
+    if (process.platform !== "win32") {
+      await check(t, testRetryNotificationDoesNotInterruptTurn);
+      await check(t, testSandboxNamespaceDiagnosticIsPreserved);
+      await check(t, testOwnedArtifactToolFailureDiagnosticIsPreserved);
+      await check(
+        t,
+        () => testArtifactDiagnosticSurvivesWorkerRetries("discovery:\0" + "0"),
+        "artifact retry diagnostic: controls",
+      );
+      await check(
+        t,
+        () => testArtifactDiagnosticSurvivesWorkerRetries("😀".repeat(1300)),
+        "artifact retry diagnostic: Unicode",
+      );
+      await check(t, testCodeModeFrameDiagnosticSurvivesSuccessfulTurn);
+      await check(t, testUnstructuredConfigurationFailureRemainsRetryable);
+      await check(t, testUnstructuredThreadStartFailureRemainsRetryable);
+      await check(t, testPolicyFailuresRemainWorkerErrors);
+      await check(t, testMalformedCommandEventsRemainRetryable);
+      await check(t, testRateLimitPolicyFailureRemainsRetryable);
+      await check(
+        t,
+        () => testArtifactStartupTimeoutClassification(runFixtureWorker),
+        testArtifactStartupTimeoutClassification.name,
+      );
+    }
+  });
+} finally {
+  restoreEnv("FAKE_CODEX_MARKER", previousMarker);
+  await temporaryDirectories.cleanup();
+}
+
+async function check(
+  t: TestContext,
+  run: () => void | Promise<void>,
+  name = run.name,
+) {
+  process.stdout.write(`Running ${t.name} / ${name}\n`);
+  await t.test(name, run);
+}
+
+function testConfiguredExecutablePaths() {
   assert.equal(
     resolveCodexPath({}, "darwin"),
     path.join(process.cwd(), "codex"),
@@ -214,21 +309,6 @@ try {
     ),
     path.join(originalCwd, "codex"),
   );
-  testOsErrorCodesRemainRetryable();
-  testTextualMissingPathErrorsRemainRetryable();
-  testWorkerErrorClassificationPreservesExplicitFailures();
-  await testWindowsAppsCodexFallsBackToRelocatedBinary();
-  await testWindowsNpmPackageResolution();
-  await testWindowsNpmPackageResolution("managed");
-  if (process.platform === "win32") {
-    await testWindowsLongExecutableLaunches();
-    await testWindowsRootRelativePathsStayBoundToOriginalDrive();
-    await testWindowsWorkerEnvironmentPreservesMixedCaseKeys();
-    await testWindowsLauncherSkipsExtensionlessNpmShim();
-  }
-} finally {
-  restoreEnv("FAKE_CODEX_MARKER", previousMarker);
-  await temporaryDirectories.cleanup();
 }
 
 function testOsErrorCodesRemainRetryable() {
@@ -1393,6 +1473,8 @@ async function testWorkerRuntimeSettings() {
     "LD_LIBRARY_PATH",
     "DYLD_LIBRARY_PATH",
     "DYLD_FALLBACK_LIBRARY_PATH",
+    "TEMP",
+    "TMP",
   ].map((name) => [name, process.env[name]] as const);
   const originalSpawn = childProcess.spawn;
   try {
@@ -1403,6 +1485,9 @@ async function testWorkerRuntimeSettings() {
     delete process.env.SYNTHETIC_HEADER_VALUE;
     delete process.env.CODEX_SQLITE_HOME;
     for (const [configuration, expected] of cases) {
+      for (const [name, value] of saved) {
+        if (name === "TEMP" || name === "TMP") restoreEnv(name, value);
+      }
       const fixture = await fakeCodexFixture(
         deniedWorkerPermissionProfile,
         true,
@@ -1464,6 +1549,15 @@ env_key = "SYNTHETIC_GATEWAY_KEY"`,
       );
       const providerHeaders = settings.map((_, index) =>
         index === 0 ? undefined : ` synthetic-header-${index}\t`,
+      );
+      const temporaryEnvironments = settings.map((_, index) => ({
+        TEMP: path.join(fixture.root, `temp-${index}`),
+        TMP: path.join(fixture.root, `tmp-${index}`),
+      }));
+      await Promise.all(
+        temporaryEnvironments.flatMap((environment) =>
+          Object.values(environment).map((directory) => mkdir(directory)),
+        ),
       );
       const workerConfigurations = Array.from(
         { length: settings.length },
@@ -1571,6 +1665,10 @@ env_key = "SYNTHETIC_GATEWAY_KEY"`,
                   wire_api: "responses",
                   env_key: "SYNTHETIC_GATEWAY_KEY",
                   env_http_headers: { "X-Synthetic": "SYNTHETIC_HEADER_VALUE" },
+                  aws: {
+                    region: index % 2 === 0 ? "us-east-2" : "us-west-2",
+                    profile: `synthetic-scan-${index}`,
+                  },
                   ...(index === 3 ? {} : { requires_openai_auth: index === 2 }),
                   experimental_bearer_token: `synthetic-bearer-${index}`,
                   auth: {
@@ -1624,6 +1722,9 @@ env_key = "SYNTHETIC_GATEWAY_KEY"`,
                       fixture.root,
                       `native-state-${index}`,
                     ),
+                    ...(index === 1
+                      ? { TMP: temporaryEnvironments[index].TEMP }
+                      : {}),
                   },
             authentication:
               index === 0
@@ -1659,6 +1760,7 @@ env_key = "SYNTHETIC_GATEWAY_KEY"`,
             configuration: {
               ...parsedConfiguration,
               ...inheritedTelemetry,
+              projects: { [fixture.root]: { trust_level: "trusted" } },
               ...Object.fromEntries(
                 Object.entries(nativePaths).map(([key, value]) => [
                   key,
@@ -1749,6 +1851,7 @@ env_key = "SYNTHETIC_GATEWAY_KEY"`,
                   ...entry.authentication,
                   ...entry.workerTelemetry,
                   ...entry.nativePaths,
+                  projects: { [fixture.root]: { trust_level: "untrusted" } },
                   approval_policy: "on-request",
                   default_permissions: "parent",
                   permissions: { parent: { filesystem: { ":root": "write" } } },
@@ -1870,6 +1973,7 @@ env_key = "SYNTHETIC_GATEWAY_KEY"`,
             executors.map((executor, index) => {
               // Snapshot each scan environment independently.
               process.env.CODEX_MCP_NODE_PATH = nodePaths[index];
+              Object.assign(process.env, temporaryEnvironments[index]);
               process.env.CODEX_SECURITY_STATE_DIR = path.join(
                 fixture.root,
                 `state-${index}`,
@@ -2017,6 +2121,22 @@ env_key = "SYNTHETIC_GATEWAY_KEY"`,
               workerConfigurations[index].knowledgeDocuments,
             );
             assert.equal(invocation.codexHome, await realpath(codexHome));
+            assert.deepEqual(invocation.temporaryEnvironment, {
+              ...temporaryEnvironments[index],
+              ...(index === 1
+                ? { TMP: temporaryEnvironments[index].TEMP }
+                : {}),
+            });
+            for (const name of ["TEMP", "TMP"] as const) {
+              assert.equal(
+                process.env[name],
+                temporaryEnvironments.at(-1)![name],
+              );
+            }
+            assert.equal(
+              invocation.deepConfigPath,
+              workerConfigurations[index].workerConfigPath,
+            );
             assert.equal(
               invocation.runtimeEnvironment.CODEX_SECURITY_STATE_DIR,
               path.join(fixture.root, `state-${index}`),
@@ -2048,6 +2168,13 @@ env_key = "SYNTHETIC_GATEWAY_KEY"`,
               web_search: workerConfigurations[index].webSearch,
               "windows.sandbox": workerConfigurations[index].windowsSandbox,
             });
+            assert.deepEqual(
+              nativeConfigOverrides(invocation.argv).filter((override) =>
+                /^projects[.=]/.test(override),
+              ),
+              [],
+              "Patch project trust is not forwarded to discovery, reducer or resumed workers.",
+            );
             assert.deepEqual(
               JSON.parse(
                 JSON.stringify(
@@ -2199,6 +2326,8 @@ env_key = "SYNTHETIC_GATEWAY_KEY"`,
                 "mcp",
                 "server.mjs",
               ),
+              "mcp_servers.cs_artifacts.args.1": "--artifact-writer",
+              "mcp_servers.cs_artifacts.args.2": "--stdio",
               "mcp_servers.cs_artifacts.env.CODEX_SECURITY_PLUGIN_ROOT":
                 path.join(fixture.root, `plugin-${index}`),
               "mcp_servers.cs_artifacts.env.CODEX_SECURITY_ARTIFACT_LAYOUT":
@@ -2275,6 +2404,18 @@ env_key = "SYNTHETIC_GATEWAY_KEY"`,
               selectedProvider,
               "worker preflight must use the same scan environment",
             );
+            const index = workerConfigurations.indexOf(selectedProvider);
+            assert.equal(preflight.codexHome, await realpath(codexHome));
+            assert.equal(
+              preflight.stateDirectory,
+              path.join(fixture.root, `state-${index}`),
+            );
+            assert.deepEqual(preflight.temporaryEnvironment, {
+              ...temporaryEnvironments[index],
+              ...(index === 1
+                ? { TMP: temporaryEnvironments[index].TEMP }
+                : {}),
+            });
             assert.equal(
               launch.environment!.CODEX_SECURITY_STATE_DIR,
               path.join(
@@ -2415,6 +2556,21 @@ async function testBedrockCredentialsReachWorker(
   assert.ok(awsEnvironment.AWS_ACCESS_KEY_ID);
   assert.ok(awsEnvironment.AWS_SECRET_ACCESS_KEY);
   assert.ok(awsEnvironment.AWS_SESSION_TOKEN);
+  const codexHome = path.join(fixture.root, "private profile home");
+  const nativeProfile = `bedrock_${credentials}`;
+  const providerConfig = {
+    aws: {
+      region: credentials === "all" ? "eu-west-1" : "eu-central-1",
+      profile: `synthetic-bedrock-${credentials}`,
+    },
+  };
+  await mkdir(codexHome);
+  await writeFile(
+    path.join(codexHome, `${nativeProfile}.config.toml`),
+    stringifyToml({
+      model_providers: { "amazon-bedrock": providerConfig },
+    }),
+  );
   const configPath = path.join(fixture.root, "bedrock.toml");
   await writeFile(
     configPath,
@@ -2423,12 +2579,19 @@ async function testBedrockCredentialsReachWorker(
   const deepConfigPath = path.join(fixture.root, "bedrock-workers.toml");
   await writeFile(
     deepConfigPath,
-    '[worker_runtime]\nmodel_provider = "amazon-bedrock"\nmodel_reasoning_summary = "none"\n',
+    stringifyToml({
+      worker_runtime: {
+        model_provider: "amazon-bedrock",
+        model_reasoning_summary: "none",
+        native_profile: nativeProfile,
+      },
+    }),
   );
   const environment = {
     ...Object.fromEntries(awsNames.map((name) => [name, awsEnvironment[name]])),
     OPENAI_API_KEY: undefined,
     CODEX_API_KEY: undefined,
+    CODEX_HOME: codexHome,
     CODEX_SECURITY_CONFIG_PATH: configPath,
     CODEX_SECURITY_DEEP_SCAN_CONFIG_PATH: deepConfigPath,
     CODEX_CLI_PATH: fixture.executablePath,
@@ -2467,6 +2630,15 @@ async function testBedrockCredentialsReachWorker(
         const invocation = await readJson(fixture.markerPath);
         assert.deepEqual(invocation.bedrockAuthentication, awsEnvironment);
         assert.deepEqual(invocation.openaiAuthentication, {});
+        assertFlagPair(invocation.argv, "--profile", nativeProfile);
+        assert.deepEqual(
+          JSON.parse(
+            JSON.stringify(
+              parseToml(invocation.profileContents).model_providers,
+            ),
+          ),
+          { "amazon-bedrock": providerConfig },
+        );
         assert.equal(
           invocation.argv.includes("resume"),
           resumeThreadId !== undefined,
@@ -2785,6 +2957,63 @@ async function testArtifactServerUsesExtendedStartupTimeout() {
   });
 }
 
+async function testReducerAttemptContext() {
+  const fixture = await fakeCodexFixture();
+  const previousPath = process.env.CODEX_CLI_PATH;
+  process.env.CODEX_CLI_PATH = fixture.executablePath;
+  try {
+    const promptPath = path.join(fixture.root, "prompt.md");
+    const workingDirectory = path.join(fixture.root, "artifacts");
+    await mkdir(workingDirectory);
+    await writeFile(promptPath, "fixture reducer prompt\n");
+    const deepReducer = {
+      scanRoot: path.join(fixture.root, "scans"),
+      claimedWorkers: [
+        {
+          id: "worker-1",
+          resultPath: path.join(fixture.root, "worker", "result.json"),
+          attempt: 2,
+        },
+      ],
+    };
+    for (const resume of [false, true]) {
+      await new CodexSdkWorkerExecutor({
+        parentSandbox: trustedParentSandbox,
+        artifactContext: {
+          pluginRoot: fixture.root,
+          scanRoot: deepReducer.scanRoot,
+          repoRoot: fixture.root,
+          scanId: "fixture-scan-id",
+        },
+      }).run({
+        kind: "dedup",
+        promptPath,
+        workingDirectory,
+        subagents: 0,
+        signal: new AbortController().signal,
+        ...(resume
+          ? {
+              resumeThreadId: "fixture-existing-thread",
+              continuationPrompt: "continue the reducer\n",
+            }
+          : {}),
+        artifactContext: {
+          root: workingDirectory,
+          layout: "reducer",
+          deepReducer,
+        },
+      });
+      const invocation = JSON.parse(await readFile(fixture.markerPath, "utf8"));
+      assertConfigOverrides(invocation.argv, {
+        "mcp_servers.cs_artifacts.env.CODEX_SECURITY_REDUCER_CONTEXT_JSON":
+          JSON.stringify(deepReducer),
+      });
+    }
+  } finally {
+    restoreEnv("CODEX_CLI_PATH", previousPath);
+  }
+}
+
 async function testSdkResumesExistingThread() {
   return withWorkerFixture(async (fixture, promptPath, workingDirectory) => {
     await writeFile(promptPath, "original worker prompt\n");
@@ -2984,10 +3213,7 @@ export { recordCodexSecurityDeepReduction } from "./src/artifact-deep-reducer.ts
           return message.includes(reference);
         },
       );
-      // Truncating the long, well-formed emoji message splits a surrogate pair.
-      const persistedDiagnostic = reference.includes("\0")
-        ? message
-        : "\ufffd\n...[truncated; sha256:";
+      const persistedDiagnostic = message;
       process.env.FAKE_CODEX_ARTIFACT_EVENT = JSON.stringify({
         type: "item.completed",
         item: {
@@ -3460,35 +3686,6 @@ async function testMalformedCommandEventsRemainRetryable() {
   }
 }
 
-async function testArtifactStartupTimeoutClassification() {
-  for (const prompt of [
-    "ARTIFACT_MCP_STARTUP_TIMEOUT",
-    "LEGACY_ARTIFACT_MCP_STARTUP_TIMEOUT",
-    "ARTIFACT_MCP_STARTUP_TIMEOUT_REQUEST_TIMED_OUT",
-    "ARTIFACT_MCP_STARTUP_TIMEOUT_SYNC_AUTH_WARNING",
-    "LEGACY_ARTIFACT_MCP_STARTUP_TIMEOUT_SYNC_AUTH_WARNING",
-    "ARTIFACT_MCP_STARTUP_TIMEOUT_BOTH_AUTH_WARNINGS",
-    "LEGACY_ARTIFACT_MCP_STARTUP_TIMEOUT_BOTH_AUTH_WARNINGS",
-    "ARTIFACT_MCP_STARTUP_TIMEOUT_REQUEST_TIMED_OUT_SYNC_AUTH_WARNING",
-    "ARTIFACT_MCP_STARTUP_TIMEOUT_REQUEST_TIMED_OUT_BOTH_AUTH_WARNINGS",
-    "ARTIFACT_MCP_STARTUP_TIMEOUT_WITH_MISSING_API_KEY",
-    "ARTIFACT_MCP_STARTUP_TIMEOUT_WITH_POLICY_REFUSAL",
-    "ARTIFACT_MCP_STARTUP_TIMEOUT_REQUEST_TIMED_OUT_SYNC_AUTH_WARNING_WITH_MISSING_API_KEY",
-    "ARTIFACT_MCP_STARTUP_TIMEOUT_REQUEST_TIMED_OUT_BOTH_AUTH_WARNINGS_WITH_POLICY_REFUSAL",
-    "OTHER_MCP_STARTUP_TIMEOUT",
-    "OTHER_MCP_STARTUP_TIMEOUT_REQUEST_TIMED_OUT_SYNC_AUTH_WARNING",
-    "CATALOG_AUTH_ONLY",
-    "SYNC_AUTH_ONLY",
-  ]) {
-    await assert.rejects(
-      runFixtureWorker(prompt),
-      (error: NodeJS.ErrnoException & { cause?: NodeJS.ErrnoException }) =>
-        error?.name === "Error",
-      `${prompt} should remain retryable`,
-    );
-  }
-}
-
 async function testMissingParentSandboxFailsBeforeWorkerLaunch() {
   const fixture = await fakeCodexFixture();
   const previousPath = process.env.CODEX_CLI_PATH;
@@ -3656,37 +3853,6 @@ function assertWorkerSubagentPolicy(
 function restoreEnv(name: string, value: string | undefined) {
   if (value === undefined) delete process.env[name];
   else process.env[name] = value;
-}
-
-function nativeConfigOverrides(args: readonly string[]) {
-  return args.flatMap((arg, index) =>
-    arg === "--config" || arg === "-c" ? [args[index + 1]] : [],
-  );
-}
-
-function assertConfigOverrides(
-  args: readonly string[],
-  values: Record<string, string | number | boolean | undefined>,
-) {
-  const overrides = nativeConfigOverrides(args).map((value) =>
-    parseToml(value),
-  );
-  for (const [key, value] of Object.entries(values)) {
-    const supplied = overrides.map((config) =>
-      key
-        .split(".")
-        .reduce<unknown>(
-          (current, part) =>
-            (current as Record<string, unknown> | undefined)?.[part],
-          config,
-        ),
-    );
-    assert.deepEqual(
-      supplied.findLast((item) => item !== undefined),
-      value,
-      key,
-    );
-  }
 }
 
 async function withWorkerFixture<Result>(

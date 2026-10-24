@@ -105,11 +105,11 @@ export class ScanCostLimitExceededError extends ScanInterruptedError {
 export function scanCostLimitFailureMessage(
   maxCostUsd: number,
   cost: Readonly<ScanCost>,
-  scanDir: string | null,
+  scanDir: string,
+  partialOutput?: boolean,
 ): string {
-  const output =
-    scanDir === null
-      ? "no partial output was kept"
-      : `partial output remains at ${scanDir}`;
+  let output = `scan output directory: ${scanDir}`;
+  if (partialOutput === true) output = `partial output remains at ${scanDir}`;
+  if (partialOutput === false) output = "no partial output was kept";
   return `Scan stopped: short-context budget baseline ${formatUsd(cost.estimatedUsd)} exceeded the ${formatUsd(maxCostUsd)} limit; estimated cost ${formatScanCost(cost)}; ${output}.`;
 }

@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { mkdir, rm, unlink, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { main } from "../src/cli.js";
-import { CodexSecurityError } from "../src/index.js";
+import { CodexSecurityError, ScanResult } from "../src/index.js";
 import {
   FakeSignals,
   capture,
@@ -8,6 +10,7 @@ import {
   fakePreflight,
   fakeResult,
 } from "./cli-fixtures.js";
+import { temporaryDirectory } from "./support/temporary-directories.js";
 
 const commands = [
   ["scan", ["scan", "."]],
@@ -35,6 +38,9 @@ function failingScan(message: string, onRun?: () => void) {
   deps.createSecurity = () => ({
     run: async () => {
       onRun?.();
+      throw new CodexSecurityError(message);
+    },
+    validate: async () => {
       throw new CodexSecurityError(message);
     },
     preflight: async () => fakePreflight(),
@@ -264,6 +270,46 @@ test.each(commands)(
   },
 );
 
+test("reports empty output after an interrupted validation while returning the completed scan", async () => {
+  const root = await temporaryDirectory("validation-interrupt-");
+  try {
+    const repository = join(root, "repository");
+    const scanDir = join(root, "scan");
+    await mkdir(repository);
+    await mkdir(scanDir);
+    const result = new ScanResult({ ...fakeResult(), scanDir });
+    await writeFile(result.manifestPath, JSON.stringify(result.manifest));
+    const stdout = capture();
+    const stderr = capture();
+    const signals = new FakeSignals();
+    const exit = await main(
+      ["scan", ".", "--validate", "--verbose", "--json", "--full-output"],
+      stdout.stream,
+      stderr.stream,
+      dependencies({
+        currentDirectory: repository,
+        result,
+        signals,
+        onWorkbench: () => {
+          signals.emit("SIGINT");
+          return { scan: { targetPath: repository } };
+        },
+        onClose: () => unlink(result.manifestPath),
+      }),
+    );
+    const message = "Validation interrupted. No scan output was kept.";
+    expect(exit).toBe(130);
+    expectFailure(stdout.text(), true, "SCAN_FAILED", message, {
+      ...result.toJSON(),
+      validation: { status: "failed", findings: 0, exitCode: 130 },
+    });
+    expect(stderr.text()).toContain(message);
+    expect(stderr.text()).toContain("partial_output=false");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("retains diagnostics when the latest-scan working directory is unavailable", async () => {
   for (const flags of [[], ["--json"], ["--json", "--full-output"]]) {
     const stdout = capture();
@@ -445,3 +491,42 @@ test.each(commands.slice(1))(
     expectFailure(failure.text(), true, "SCAN_FAILED", message);
   },
 );
+
+for (const command of ["rerun", "resume"]) {
+  test.each([true, false, undefined])(
+    `${command} restores owner suggestions from its saved recipe (%p)`,
+    async (ownerSuggestions) => {
+      let observed: boolean | undefined;
+      let called = false;
+      const deps = dependencies({
+        onWorkbench: () => ({
+          scanId: "saved-scan",
+          scanDir: "/tmp/saved-scan",
+          recipe: {
+            repository: "/original/repository",
+            target: { kind: "repository", paths: [] },
+            mode: "deep",
+            config: {},
+            ...(ownerSuggestions === undefined ? {} : { ownerSuggestions }),
+          },
+        }),
+        onTurn: (_repository, options) => {
+          called = true;
+          observed = options.ownerSuggestions;
+        },
+      });
+      const stdout = capture();
+      const stderr = capture();
+      expect(
+        await main(
+          ["scans", command, "saved-scan", "--json"],
+          stdout.stream,
+          stderr.stream,
+          deps,
+        ),
+      ).toBe(0);
+      expect(called).toBe(true);
+      expect(observed).toBe(ownerSuggestions);
+    },
+  );
+}

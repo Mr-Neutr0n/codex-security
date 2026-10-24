@@ -1094,6 +1094,10 @@ try {
   assertNoError(initialized);
   assert.equal(initialized.result.serverInfo.name, "codex-security");
   assert.equal(initialized.result.serverInfo.title, "Codex Security");
+  assert.equal(
+    initialized.result.serverInfo.version,
+    (await readJson(mcpAppRoot, "package.json")).version,
+  );
   assert.equal(initialized.result.capabilities.resources, undefined);
   assert.deepEqual(
     initialized.result.capabilities.experimental["codex/sandbox-state-meta"],
@@ -3489,7 +3493,7 @@ with sqlite3.connect(sys.argv[1]) as connection:
     },
   });
   assertNoError(rotatedProgress);
-  const failureMessage = "--failure\nline";
+  const failureMessage = `--failure\n${"diagnostic ".repeat(500)}final cause`;
   const rotatedFailure = await testServer.callTool(2039, {
     name: "fail_codex_security_scan",
     arguments: {

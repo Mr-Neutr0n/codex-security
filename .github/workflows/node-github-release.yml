@@ -1,4 +1,5 @@
 name: node-github-release
+run-name: Publish ${{ inputs.tag }}
 
 on:
   workflow_dispatch:
@@ -42,7 +43,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: refs/heads/main
+          ref: ${{ github.sha }}
 
       - name: Set up Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -736,6 +737,7 @@ jobs:
       contents: read
       packages: write
       attestations: write
+      artifact-metadata: write
       id-token: write
     uses: ./.github/workflows/container-release.yml
     with:
