@@ -4,8 +4,13 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parse } from "smol-toml";
+import { forwardExternalImportSetting } from "./external-imports-feature.js";
 import type { JsonObject } from "./config.js";
-import { CodexSecurityError, PluginBootstrapError } from "./errors.js";
+import {
+  CodexSecurityError,
+  PluginBootstrapError,
+  errorMessage,
+} from "./errors.js";
 import {
   executablePathForSpawn,
   expandHome,
@@ -33,12 +38,14 @@ export function environmentEntry(
 export function withoutOpenAiApiKeys<Value>(
   environment: Record<string, Value>,
 ): Record<string, Value> {
-  return Object.fromEntries(
+  const child = Object.fromEntries(
     Object.entries(environment).filter(
       ([name]) =>
         !["OPENAI_API_KEY", "CODEX_API_KEY"].includes(name.toUpperCase()),
     ),
   );
+  forwardExternalImportSetting(environment, child);
+  return child;
 }
 
 /** @internal */
@@ -68,17 +75,15 @@ export async function readCodexHomeConfig(
     signal?.throwIfAborted();
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
     throw new CodexSecurityError(
-      "Could not read the configured Codex provider.",
+      `Could not read the configured Codex provider: ${errorMessage(error)}`,
+      { cause: error },
     );
   }
 }
 
-export interface LoginResult {
-  success: boolean;
-  exitCode: number | null;
-  stdout: string;
-  stderr: string;
-}
+export interface LoginResult extends Awaited<
+  ReturnType<typeof runCodexCommand>
+> {}
 
 export interface AccountStatus {
   authenticated: boolean;
@@ -142,7 +147,9 @@ export class CodexLoginHandle {
         };
         this.#settleInstructionWaiters(result);
         if (result.success) {
-          Promise.resolve(onSuccess()).then(() => resolve(result), reject);
+          Promise.resolve()
+            .then(onSuccess)
+            .then(() => resolve(result), reject);
         } else {
           resolve(result);
         }
