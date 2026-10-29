@@ -62,59 +62,23 @@ Install the package locally in your TypeScript project:
 npm install @openai/codex-security
 ```
 
-### Check package and plugin versions
+### Package and plugin versions
 
-For a bug report about a local SDK installation, run this from the directory
-containing its `node_modules`. For a global installation, run
-`codex-security info` with the same output flags.
+For bug reports, run `npx @openai/codex-security info --json` in the project
+where the SDK is installed, or `codex-security info --json` for a global install.
+Include the npm version (`cliVersion` and `sdkVersion`), bundled plugin manifest
+version (`bundledPluginVersion`), and Codex runtime and SDK pins (`codexVersion`
+and `codexSdkVersion`). If you used a marketplace plugin, a plugin supplied by
+path, or a custom Codex executable, include its version separately.
 
-```bash
-node node_modules/@openai/codex-security/bin/codex-security.mjs info --json --filter-output cliVersion,sdkVersion,bundledPluginVersion,codexVersion,codexSdkVersion
-```
+For example, `npm view @openai/codex-security@0.1.5 gitHead dist.integrity`
+shows the registry's source commit and tarball digest. Compare `gitHead` with
+the commit for tag `npm-v0.1.5`. `npm pack @openai/codex-security@0.1.5` downloads
+the archive, including `package/_bundled_plugin/.codex-plugin/plugin.json`.
 
-`cliVersion` and `sdkVersion` identify the same `@openai/codex-security` npm
-release. `bundledPluginVersion` is the security plugin's manifest version.
-`codexVersion` and `codexSdkVersion` are the package's pins for the Codex
-executable (`@openai/codex`) and SDK (`@openai/codex-sdk`). If you supplied a
-custom executable or plugin, include its version separately. For a marketplace
-installation, include the displayed version and any public marketplace name and
-plugin ID. The marketplace and npm releases can advance independently. Compare
-their files to determine whether the plugin content differs.
-
-To inspect a published npm release, run this Bash example from a checkout of
-this repository with its release tags fetched. For versions `0.1.0` through `0.1.21`, set
-`plugin=sdk/typescript/_bundled_plugin` to inspect the tracked bundle.
-
-```bash
-version=0.6.0
-tag="npm-v${version}"
-plugin=plugins/codex-security
-git rev-parse "${tag}^{commit}" "${tag}:${plugin}"
-git show "${tag}:${plugin}/.codex-plugin/plugin.json" | jq -r .version
-
-metadata=$(curl -fsSL "https://registry.npmjs.org/@openai/codex-security/$version")
-jq '{gitHead, integrity: .dist.integrity}' <<< "$metadata"
-curl -fsSL "$(jq -r .dist.tarball <<< "$metadata")" |
-  tar -xzOf - package/_bundled_plugin/.codex-plugin/plugin.json | jq -r .version
-
-curl -fsSL "$(jq -r .dist.attestations.url <<< "$metadata")" |
-  jq -r '.attestations[] | select(.predicateType == "https://slsa.dev/provenance/v1")
-    | .bundle.dsseEnvelope.payload | @base64d | fromjson
-    | .predicate.buildDefinition.resolvedDependencies[] | [.uri, .digest.gitCommit] | @tsv'
-```
-
-Compare npm's `gitHead` with the first Git hash, the release commit. The second
-hash identifies the plugin source tree. Packaging builds `_bundled_plugin/` from
-selected source files and compiled artifacts. `dist.integrity` identifies the
-bytes of the complete npm tarball. Include the commit and integrity when
-reporting a content mismatch.
-
-The last command reads the source URI and commit recorded in the npm provenance
-statement. Compare the entry for the release tag with the first Git hash. This
-also works for releases `0.1.0` and `0.1.1`, which lack npm's `gitHead`. The
-release workflow verifies the signature, tarball digest, tagged commit, and
-publishing workflow identity. See the [0.6.0 verification run](https://github.com/openai/codex-security/actions/runs/39778103720/job/119822118011)
-and [release verification](https://github.com/openai/codex-security/blob/main/RELEASING.md#verify).
+The [release workflow](https://github.com/openai/codex-security/blob/main/.github/workflows/node-github-release.yml)
+verifies the signed attestation that binds the tarball to the tagged commit.
+For `0.1.0` and `0.1.1`, npm omits `gitHead`. Use the commit from the verified attestation.
 
 ## Authentication
 
