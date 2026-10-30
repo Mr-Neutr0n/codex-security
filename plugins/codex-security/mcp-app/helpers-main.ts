@@ -13,7 +13,6 @@ import {
   normalizeCandidateBatch,
   normalizeCandidatesCommand,
 } from "./src/helpers/normalize-candidates";
-import { validatePatchRiskAssessmentCommand } from "./src/helpers/validate-patch-risk-assessment";
 import { deepReviewInputCommand } from "./src/helpers/deep-review-input";
 import { inventoryCommand } from "./src/helpers/generate-inventory";
 import { bindRepoScopesCommand } from "./src/helpers/bind-repo-scopes";
@@ -66,10 +65,14 @@ function runHelper(): void {
       "Usage: store-findings\nReads a JSON object from stdin with an absolute stateDirectory and payload.entries containing finding and embedding records; payload.repositoryId is optional.",
     "list-stored-findings":
       "Usage: list-stored-findings\nReads a JSON object from stdin with an absolute stateDirectory, positive payload.limit and non-negative payload.offset.",
-    "store-external-findings":
-      "Usage: store-external-findings\nReads a JSON object from stdin with an absolute stateDirectory and payload containing repository, provider, sourceKey and findings with source_finding_id and evidence.",
-    "list-external-findings":
-      "Usage: list-external-findings\nReads a JSON object from stdin with an absolute stateDirectory and payload.repository; payload.id optionally selects one external finding.",
+    ...(process.env.CODEX_SECURITY_ENABLE_EXTERNAL_IMPORTS === "1"
+      ? {
+          "store-external-findings":
+            "Usage: store-external-findings\nReads a JSON object from stdin with an absolute stateDirectory and payload containing repository, provider, sourceKey and findings with source_finding_id and evidence.",
+          "list-external-findings":
+            "Usage: list-external-findings\nReads a JSON object from stdin with an absolute stateDirectory and payload.repository; payload.id optionally selects one external finding.",
+        }
+      : {}),
     "find-potential-duplicates":
       "Usage: find-potential-duplicates\nReads a JSON object from stdin with an absolute stateDirectory, payload.findingId and payload.scope containing either repositoryId or allRepositories: true.",
     "store-dedupe-groups":
@@ -84,6 +87,7 @@ function runHelper(): void {
   if (
     command === "generate-in-scope-files" ||
     command === "make-repo-scope-input" ||
+    command === "make-hosted-repo-scope-input" ||
     command === "make-diff-rank-input"
   ) {
     void inventoryCommand(command, args).then((code) => {
@@ -94,7 +98,11 @@ function runHelper(): void {
   } else if (command === "normalize-candidates") {
     process.exitCode = normalizeCandidatesCommand(args, posixHome);
   } else if (command === "validate-patch-risk-assessment") {
-    process.exitCode = validatePatchRiskAssessmentCommand(args);
+    void import("./src/helpers/validate-patch-risk-assessment").then(
+      ({ validatePatchRiskAssessmentCommand }) => {
+        process.exitCode = validatePatchRiskAssessmentCommand(args);
+      },
+    );
   } else if (command === "copy-deep-review-input") {
     process.exitCode = deepReviewInputCommand(args, posixHome);
   } else if (command === "bind-repo-scopes") {

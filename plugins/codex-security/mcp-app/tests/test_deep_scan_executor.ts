@@ -1,7 +1,8 @@
-import { testArtifactStartupTimeoutClassification } from "./deep_scan_startup_cases.ts";
 import {
   workerGitEnvironment,
+  workerRuntimeEnvironment,
   workerScanEnvironment,
+  externalImports,
   expectedGitEnvironment,
   restoreEnv,
 } from "./support/fake-codex-source.ts";
@@ -45,6 +46,7 @@ import {
 } from "node:fs/promises";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import path from "node:path";
+import { createInterface } from "node:readline";
 import { rootCertificates } from "node:tls";
 import { fileURLToPath } from "node:url";
 import { importModule } from "./import-module.ts";
@@ -79,9 +81,6 @@ const {
   resolveCodexPath,
   snapshotWorkerEnvironment,
   appendItemDiagnostic,
-  classifyCodexWorkerError,
-  codexWorkerTurnError,
-  DeepScanNonRetryableError,
   isCodexCybersecurityPolicyRefusal,
   parseDeepScan,
 } = await importModule({
@@ -92,7 +91,7 @@ const {
     // Expose the environment snapshot only for tests.
     contents: `${await readFile(executorSource, "utf8")}
 export { snapshotWorkerEnvironment, appendItemDiagnostic };
-export * from "./errors.js";
+export { isCodexCybersecurityPolicyRefusal } from "./errors.js";
 export { parseDeepScan } from "./response.js";`,
     loader: "ts",
     resolveDir: path.dirname(fileURLToPath(executorSource)),
@@ -120,10 +119,14 @@ try {
     }
   });
 
+  await test(
+    "Deep worker runtime settings at the child-process boundary",
+    testWorkerRuntimeSettings,
+  );
+
   await test("Deep worker runtime settings", async (t) => {
     await check(t, testLargeScopeTransport);
     await check(t, testOpenAiCredentialsReachWorker);
-    await check(t, testWorkerRuntimeSettings);
     await check(t, testUnsupportedProviderSnapshotFailsBeforeLaunch);
     await check(
       t,
@@ -202,6 +205,7 @@ try {
       () => testWindowsNpmPackageResolution("managed"),
       "managed Windows npm package resolution",
     );
+    await check(t, testHoistedManagedWindowsPackages);
     if (process.platform === "win32") {
       await check(t, testWindowsLongExecutableLaunches);
       await check(t, testWindowsRootRelativePathsStayBoundToOriginalDrive);
@@ -211,11 +215,8 @@ try {
   });
 
   await test("Deep worker diagnostics", async (t) => {
+    await check(t, testFailedWorkerItems);
     await check(t, testCodeModeFrameDiagnosticBoundaries);
-    await check(t, testUsageLimitClassification);
-    await check(t, testOsErrorCodesRemainRetryable);
-    await check(t, testTextualMissingPathErrorsRemainRetryable);
-    await check(t, testWorkerErrorClassificationPreservesExplicitFailures);
     if (process.platform !== "win32") {
       await check(t, testRetryNotificationDoesNotInterruptTurn);
       await check(t, testSandboxNamespaceDiagnosticIsPreserved);
@@ -231,16 +232,11 @@ try {
         "artifact retry diagnostic: Unicode",
       );
       await check(t, testCodeModeFrameDiagnosticSurvivesSuccessfulTurn);
-      await check(t, testUnstructuredConfigurationFailureRemainsRetryable);
-      await check(t, testUnstructuredThreadStartFailureRemainsRetryable);
+      await check(t, testSetupExitDiagnosticsRemainRetryable);
       await check(t, testPolicyFailuresRemainWorkerErrors);
       await check(t, testMalformedCommandEventsRemainRetryable);
       await check(t, testRateLimitPolicyFailureRemainsRetryable);
-      await check(
-        t,
-        () => testArtifactStartupTimeoutClassification(runFixtureWorker),
-        testArtifactStartupTimeoutClassification.name,
-      );
+      await check(t, testArtifactStartupTimeoutRemainsRetryable);
     }
   });
 } finally {
@@ -316,90 +312,6 @@ function testConfiguredExecutablePaths() {
     ),
     path.join(originalCwd, "codex"),
   );
-}
-
-function testOsErrorCodesRemainRetryable() {
-  for (const code of ["ENOENT", "EACCES", "ENOEXEC", "EPERM"]) {
-    const original = Object.assign(new Error(`spawn codex ${code}`), { code });
-    const classified = classifyCodexWorkerError(original);
-    assert.equal(classified, original);
-    assert.equal(classified.name, "Error");
-  }
-}
-
-function testTextualMissingPathErrorsRemainRetryable() {
-  for (const diagnostic of [
-    "Error: No such file or directory (os error 2)",
-    "Error: The system cannot find the file specified. (os error 2)",
-  ]) {
-    const original = new Error(
-      ["Codex Exec exited with code 1:", diagnostic].join("\n"),
-    );
-    const classified = classifyCodexWorkerError(original);
-    assert.equal(classified, original);
-  }
-}
-
-function testWorkerErrorClassificationPreservesExplicitFailures() {
-  const explicit = new DeepScanNonRetryableError(
-    "Explicitly rejected worker permission profile.",
-  );
-  assert.equal(classifyCodexWorkerError(explicit), explicit);
-
-  const refusalMessages = [
-    "Request blocked by cyberPolicy.",
-    "Request blocked by a safety policy violation.",
-    "This content was flagged for possible cybersecurity risk.",
-    "This content was flagged for potentially high-risk cyber activity.",
-    "This request has been flagged for possible cybersecurity risk.",
-    "This request has been flagged for potentially high-risk cyber activity.",
-  ];
-  for (const message of refusalMessages) {
-    const original = new Error(message);
-    const classified = classifyCodexWorkerError(original);
-    assert.equal(classified, original);
-    assert.equal(classified.name, "Error");
-    assert.equal(isCodexCybersecurityPolicyRefusal(classified), true);
-
-    const explicitRefusal = new DeepScanNonRetryableError(message);
-    assert.equal(classifyCodexWorkerError(explicitRefusal), explicitRefusal);
-
-    for (const unrecognized of [
-      `Source fixture: ${message}`,
-      `${message} Source fixture.`,
-      JSON.stringify({ message }),
-      `Codex Exec exited with code 1: ${message}`,
-      `429 Too Many Requests: ${message}`,
-      ` ${message}`,
-      `${message}\n`,
-      message.toLowerCase(),
-    ]) {
-      const unrelated = new Error(unrecognized);
-      assert.equal(classifyCodexWorkerError(unrelated), unrelated);
-      assert.equal(isCodexCybersecurityPolicyRefusal(unrelated), false);
-    }
-  }
-
-  for (const message of [
-    "config parser handles unknown keys",
-    "failed to load configuration: invalid value",
-    "agents.max_threads cannot be set when features.multi_agent_v2 is enabled",
-    "authentication required",
-    "not logged in",
-    "missing API key",
-    "Codex Exec exited with code 2: failed to load configuration: invalid value",
-    "chatgpt authentication required for remote plugin catalog; api key auth is not supported",
-    "chatgpt authentication required to sync remote plugins; api key auth is not supported",
-  ]) {
-    const original = new Error(message);
-    assert.equal(classifyCodexWorkerError(original), original);
-  }
-  for (const code of ["ECONNRESET", "EPIPE", "ETIMEDOUT", "cyber_policy"]) {
-    const original = Object.assign(new Error("Unrecognized worker failure"), {
-      code,
-    });
-    assert.equal(classifyCodexWorkerError(original), original);
-  }
 }
 
 async function testWindowsRootRelativePathsStayBoundToOriginalDrive() {
@@ -848,6 +760,38 @@ async function testWindowsNpmPackageResolution(installation = "global") {
   }
 }
 
+async function testHoistedManagedWindowsPackages() {
+  const root = await temporaryDirectories.create("codex-managed-cli-");
+  const packages = path.join(root, "managed CLI", "node_modules", "@openai");
+  const codex = path.join(packages, "codex");
+  await mkdir(codex, { recursive: true });
+  await writeJson(path.join(codex, "package.json"), {});
+  const env = { PATH: "", CODEX_MANAGED_PACKAGE_ROOT: ` ${codex} ` };
+  for (const [arch, triple] of [
+    ["x64", "x86_64-pc-windows-msvc"],
+    ["arm64", "aarch64-pc-windows-msvc"],
+  ] as const) {
+    const platform = path.join(packages, `codex-win32-${arch}`);
+    const executable = path.join(
+      platform,
+      "vendor",
+      triple,
+      "bin",
+      "codex.exe",
+    );
+    await mkdir(path.dirname(executable), { recursive: true });
+    await writeJson(path.join(platform, "package.json"), {});
+    await writeFile(executable, "synthetic executable");
+    assert.equal(resolveCodexPath(env, "win32", arch), executable);
+    const override = path.join(root, "custom CLI", "codex.exe");
+    assert.equal(
+      resolveCodexPath({ ...env, CODEX_CLI_PATH: override }, "win32", arch),
+      override,
+    );
+    assert.equal(resolveCodexPath(env, "linux", arch), path.resolve("codex"));
+  }
+}
+
 function windowsLauncherEnvironment(...directories: string[]) {
   const environment = { ...process.env };
   for (const key of Object.keys(environment)) {
@@ -1196,29 +1140,10 @@ async function testOpenAiCredentialsReachWorker() {
       true,
       entry.accountResult ?? noAccount,
     );
-    const runtimeEnvironment = {
-      PATH: [
-        virtualenv === undefined
-          ? path.join(fixture.root, "runner-tools")
-          : path.join(virtualenv, "bin"),
-        path.dirname(process.execPath),
-      ].join(path.delimiter),
-      HOME: path.join(fixture.root, "home"),
-      PYTHON:
-        virtualenv === undefined
-          ? path.join(fixture.root, "tools", "python3")
-          : "python3",
-      PYTHONUTF8: "1",
-      LD_LIBRARY_PATH:
-        (process.env.LD_LIBRARY_PATH === undefined
-          ? ""
-          : process.env.LD_LIBRARY_PATH + path.delimiter) +
-        path.join(fixture.root, "libraries"),
-      DYLD_LIBRARY_PATH: path.join(fixture.root, "dylibs"),
-      DYLD_FALLBACK_LIBRARY_PATH: path.join(fixture.root, "fallback-libraries"),
-      CODEX_SECURITY_STATE_DIR: path.join(fixture.root, "state"),
-      RUNNER_TRACKING_ID: "synthetic-worker-job",
-    };
+    const runtimeEnvironment = workerRuntimeEnvironment(
+      fixture.root,
+      virtualenv,
+    );
     const previousEnvironment = [
       "OPENAI_API_KEY",
       "CODEX_API_KEY",
@@ -1463,6 +1388,7 @@ async function testWorkerRuntimeSettings() {
     "CODEX_SECURITY_PLUGIN_ROOT",
     "CODEX_SECURITY_DEEP_SCAN_CONFIG_PATH",
     "CODEX_SECURITY_KNOWLEDGE_BASE",
+    "CODEX_SECURITY_ENABLE_EXTERNAL_IMPORTS",
     "OPENAI_API_KEY",
     "CODEX_API_KEY",
     "SYNTHETIC_GATEWAY_KEY",
@@ -1980,6 +1906,10 @@ env_key = "SYNTHETIC_GATEWAY_KEY"`,
           await Promise.all(
             executors.map((executor, index) => {
               // Snapshot each scan environment independently.
+              restoreEnv(
+                "CODEX_SECURITY_ENABLE_EXTERNAL_IMPORTS",
+                externalImports[index].inherited,
+              );
               process.env.CODEX_MCP_NODE_PATH = nodePaths[index];
               Object.assign(process.env, temporaryEnvironments[index]);
               process.env.CODEX_SECURITY_STATE_DIR = path.join(
@@ -2101,6 +2031,16 @@ env_key = "SYNTHETIC_GATEWAY_KEY"`,
               workerConfigurations[index].knowledgePath,
             );
             const invocation = await readJson(workerLaunch.markerPath);
+            assert.equal(
+              invocation.runtimeEnvironment
+                .CODEX_SECURITY_ENABLE_EXTERNAL_IMPORTS,
+              externalImports[index].override ??
+                externalImports[index].inherited,
+            );
+            assert.equal(
+              process.env.CODEX_SECURITY_ENABLE_EXTERNAL_IMPORTS,
+              externalImports.at(-1)!.inherited,
+            );
             if (
               process.platform === "win32" &&
               configuration === "" &&
@@ -2350,6 +2290,7 @@ env_key = "SYNTHETIC_GATEWAY_KEY"`,
             }
             assert.equal(invocation.python, python);
             assertConfigOverrides(invocation.argv, {
+              "mcp_servers.codex-security.enabled": false,
               "mcp_servers.cs_artifacts.command": process.execPath,
               "mcp_servers.cs_artifacts.env.CODEX_SECURITY_INCLUDE_PATHS_JSON":
                 undefined,
@@ -2373,6 +2314,10 @@ env_key = "SYNTHETIC_GATEWAY_KEY"`,
               string,
               { env: Record<string, string> }
             >;
+            assert.deepEqual(Object.keys(servers).sort(), [
+              "codex-security",
+              "cs_artifacts",
+            ]);
             const scopeFile =
               servers["cs_artifacts"]!.env["CODEX_SECURITY_INCLUDE_PATHS_FILE"];
             if (index % 2 === 0) {
@@ -3385,6 +3330,51 @@ async function testOwnedArtifactToolFailureDiagnosticIsPreserved() {
   }
 }
 
+function testFailedWorkerItems() {
+  const diagnostics: CodexWorkerDiagnostic[] = [];
+  for (const [server, tool, error, result, expected] of [
+    [
+      "cs_artifacts",
+      "record_codex_security_deep_reduction",
+      null,
+      { isError: true, content: [{ type: "text", text: "provider detail" }] },
+      "provider detail",
+    ],
+    [
+      "cs_artifacts",
+      "additional_codex_security_worker_tool",
+      { message: "transport failure" },
+      null,
+      "transport failure",
+    ],
+    [
+      "codex_security_artifacts",
+      "record_codex_security_discovery_candidates",
+      null,
+      null,
+      "Codex worker artifact tool record_codex_security_discovery_candidates failed.",
+    ],
+  ] as const) {
+    appendItemDiagnostic(diagnostics, {
+      type: "mcp_tool_call",
+      status: "failed",
+      server,
+      tool,
+      error,
+      result,
+      arguments: { token: "synthetic-input-only" },
+    });
+    assert.deepEqual(diagnostics.pop(), {
+      code: "artifact_tool_failed",
+      message: expected,
+    });
+  }
+  appendItemDiagnostic(diagnostics, { type: "file_change", status: "failed" });
+  assert.deepEqual(diagnostics, [
+    { code: "file_change_failed", message: "Codex worker file change failed." },
+  ]);
+}
+
 function testCodeModeFrameDiagnosticBoundaries() {
   const failedArtifactTool = {
     type: "mcp_tool_call",
@@ -3516,6 +3506,41 @@ async function testAbortPropagation() {
   });
 }
 
+function mockWorkerSpawn(
+  executablePath: string,
+  onExec: (
+    child: ChildProcess,
+    args: readonly string[],
+    options: SpawnOptions,
+  ) => void,
+) {
+  const previousPath = process.env.CODEX_CLI_PATH;
+  process.env.CODEX_CLI_PATH = process.execPath;
+  const originalSpawn = childProcess.spawn;
+  childProcess.spawn = ((
+    command: string,
+    args: readonly string[] = [],
+    options: SpawnOptions = {},
+  ) => {
+    const child = originalSpawn(
+      command,
+      command === process.execPath ||
+        command === path.toNamespacedPath(process.execPath)
+        ? [executablePath, ...args]
+        : args,
+      options,
+    );
+    if (args[0] === "exec") onExec(child, args, options);
+    return child;
+  }) as typeof childProcess.spawn;
+  syncBuiltinESMExports();
+  return () => {
+    restoreEnv("CODEX_CLI_PATH", previousPath);
+    childProcess.spawn = originalSpawn;
+    syncBuiltinESMExports();
+  };
+}
+
 async function testCompletedWorkerSettlesWithoutWaitingForProcessExit() {
   await completedWorkerSettlesWithoutWaitingForProcessExit();
   for (const kind of ["discovery", "dedup"] as const) {
@@ -3531,27 +3556,27 @@ async function completedWorkerSettlesWithoutWaitingForProcessExit(
 ) {
   const fixture = await fakeCodexFixture();
   const saved = [
-    "CODEX_CLI_PATH",
     "CODEX_HOME",
     "CODEX_SECURITY_CONFIG_PATH",
     "CODEX_SECURITY_DEEP_SCAN_CONFIG_PATH",
   ].map((name) => [name, process.env[name]] as const);
-  process.env.CODEX_CLI_PATH = process.execPath;
-  const originalSpawn = childProcess.spawn;
-  childProcess.spawn = ((
-    command: string,
-    args: readonly string[] = [],
-    options: SpawnOptions = {},
-  ) =>
-    originalSpawn(
-      command,
-      command === process.execPath ||
-        command === path.win32.toNamespacedPath(process.execPath)
-        ? [fixture.executablePath, ...args]
-        : args,
-      options,
-    )) as typeof childProcess.spawn;
-  syncBuiltinESMExports();
+  const deadline = Promise.withResolvers<never>();
+  let timeout: NodeJS.Timeout | undefined;
+  function armDeadline(ms: number, message: string) {
+    clearTimeout(timeout);
+    timeout = setTimeout(() => deadline.reject(new Error(message)), ms);
+  }
+  let worker: ChildProcess | undefined;
+  const restoreSpawn = mockWorkerSpawn(fixture.executablePath, (child) => {
+    worker = child;
+    createInterface({ input: child.stdout! }).on("line", (line) => {
+      if (JSON.parse(line).type === "turn.completed")
+        armDeadline(
+          1_000,
+          "completed worker did not settle after turn.completed",
+        );
+    });
+  });
   if (kind !== undefined) {
     const home = path.join(fixture.root, "private profile home");
     await mkdir(home);
@@ -3577,8 +3602,6 @@ async function completedWorkerSettlesWithoutWaitingForProcessExit(
   const captureUnexpectedError = (error: NodeJS.ErrnoException) =>
     unexpectedErrors.push(error);
   let execution;
-  let timeout;
-  let childPid!: number;
 
   process.on("uncaughtException", captureUnexpectedError);
   try {
@@ -3591,6 +3614,7 @@ async function completedWorkerSettlesWithoutWaitingForProcessExit(
         ? "COMPLETE_THEN_HANG\n"
         : "COMPLETE_THEN_HANG_IGNORE_TERMINATION\n",
     );
+    armDeadline(10_000, "worker did not emit turn.completed");
     execution = new CodexSdkWorkerExecutor({
       parentSandbox: trustedParentSandbox,
     }).run({
@@ -3600,22 +3624,9 @@ async function completedWorkerSettlesWithoutWaitingForProcessExit(
       subagents: 0,
       signal: controller.signal,
       ...(resumed ? { resumeThreadId: "fixture-resumed-thread-id" } : {}),
-      onThreadStarted: async () => {
-        childPid = (await readJson(fixture.markerPath)).pid;
-      },
     });
 
-    const result = await Promise.race([
-      execution,
-      new Promise((_, reject) => {
-        timeout = setTimeout(() => {
-          controller.abort("completed worker fixture timed out");
-          reject(
-            new Error("completed worker did not settle after turn.completed"),
-          );
-        }, 1_000);
-      }),
-    ]);
+    const result = await Promise.race([execution, deadline.promise]);
     clearTimeout(timeout);
     assert.equal(
       result.threadId,
@@ -3630,40 +3641,42 @@ async function completedWorkerSettlesWithoutWaitingForProcessExit(
 
     assert.deepEqual(unexpectedErrors, []);
     if (kind === undefined) {
-      assert.throws(() => process.kill(childPid, 0), { code: "ESRCH" });
+      assert.throws(() => process.kill(worker!.pid!, 0), { code: "ESRCH" });
     }
   } finally {
     clearTimeout(timeout);
     controller.abort("completed worker fixture cleanup");
-    if (childPid) {
-      try {
-        process.kill(childPid, "SIGKILL");
-      } catch {}
-    }
+    worker?.kill("SIGKILL");
     await execution?.catch(() => {});
     process.removeListener("uncaughtException", captureUnexpectedError);
-    childProcess.spawn = originalSpawn;
-    syncBuiltinESMExports();
+    restoreSpawn();
     for (const [name, value] of saved) restoreEnv(name, value);
   }
 }
 
-async function testUnstructuredConfigurationFailureRemainsRetryable() {
+async function testArtifactStartupTimeoutRemainsRetryable() {
   await assert.rejects(
-    runFixtureWorker("CONFIG_ERROR", "setup"),
-    (error: NodeJS.ErrnoException & { cause?: NodeJS.ErrnoException }) =>
-      error?.name === "Error" &&
-      error.message.startsWith("Codex Exec exited with code 2:"),
+    runFixtureWorker("ARTIFACT_MCP_STARTUP_TIMEOUT"),
+    (error: Error) =>
+      error.name === "Error" &&
+      error.message.includes("cs_artifacts: request timed out") &&
+      !isCodexCybersecurityPolicyRefusal(error),
   );
 }
 
-async function testUnstructuredThreadStartFailureRemainsRetryable() {
-  await assert.rejects(
-    runFixtureWorker("THREAD_START_CONFIG_ERROR", "setup"),
-    (error: NodeJS.ErrnoException & { cause?: NodeJS.ErrnoException }) =>
-      error?.name === "Error" &&
-      error.message.startsWith("Codex Exec exited with code 1:"),
-  );
+async function testSetupExitDiagnosticsRemainRetryable() {
+  for (const [prompt, code] of [
+    ["CONFIG_ERROR", 2],
+    ["THREAD_START_CONFIG_ERROR", 1],
+  ] as const) {
+    await assert.rejects(
+      runFixtureWorker(prompt, "setup"),
+      (error: Error) =>
+        error.name === "Error" &&
+        error.message.startsWith(`Codex Exec exited with code ${code}:`),
+      prompt,
+    );
+  }
 }
 
 async function testPolicyFailuresRemainWorkerErrors() {
@@ -3911,26 +3924,13 @@ async function withWorkerFixture<Result>(
 
 async function testWorkerCancellation() {
   const fixture = await fakeCodexFixture();
-  const previousPath = process.env.CODEX_CLI_PATH;
-  const originalSpawn = childProcess.spawn;
   let worker: ChildProcess | undefined;
   let workerSignal: AbortSignal | undefined;
   let cancelDuringCleanup: (() => void) | undefined;
   let timeout: NodeJS.Timeout | undefined;
-  childProcess.spawn = ((
-    command: string,
-    args: readonly string[] = [],
-    options: SpawnOptions = {},
-  ) => {
-    const child = originalSpawn(
-      command,
-      command === process.execPath ||
-        command === path.toNamespacedPath(process.execPath)
-        ? [fixture.executablePath, ...args]
-        : args,
-      options,
-    );
-    if (args[0] === "exec") {
+  const restoreSpawn = mockWorkerSpawn(
+    fixture.executablePath,
+    (child, args, options) => {
       assertFlagPair(args, "--thread-source", "security_scan");
       worker = child;
       workerSignal = options.signal;
@@ -3939,11 +3939,8 @@ async function testWorkerCancellation() {
         cancelDuringCleanup?.();
         return kill.apply(this, args);
       };
-    }
-    return child;
-  }) as typeof childProcess.spawn;
-  syncBuiltinESMExports();
-  process.env.CODEX_CLI_PATH = process.execPath;
+    },
+  );
   try {
     const promptPath = path.join(fixture.root, "prompt.md");
     const workingDirectory = path.join(fixture.root, "artifacts");
@@ -4062,33 +4059,7 @@ async function testWorkerCancellation() {
     cancelDuringCleanup = undefined;
     if (worker && worker.exitCode === null && worker.signalCode === null)
       worker.kill("SIGKILL");
-    childProcess.spawn = originalSpawn;
-    syncBuiltinESMExports();
-    restoreEnv("CODEX_CLI_PATH", previousPath);
-  }
-}
-
-function testUsageLimitClassification() {
-  for (const message of [
-    "Quota exceeded. Check your plan and billing details.",
-    "Your workspace is out of credits. Add credits to continue.",
-    "Your workspace is out of credits. Ask your workspace owner to refill in order to continue.",
-    "You hit your spend cap set in your workspace. Increase your spend cap to continue.",
-    "You hit your spend cap set by the owner of your workspace. Ask an owner to increase your spend cap to continue.",
-    "You’ve hit your usage limit. Try again later.",
-    "You’ve hit your usage limit for the selected model. Switch to another model to continue.",
-  ]) {
-    const error = codexWorkerTurnError(message);
-    assert.ok(error instanceof DeepScanNonRetryableError);
-    assert.equal(error.message, message);
-  }
-  for (const message of [
-    "429 Too Many Requests",
-    "Command failed: Quota exceeded. Check your plan and billing details.",
-  ]) {
-    const error = codexWorkerTurnError(message);
-    assert.equal(error.name, "Error");
-    assert.equal(error.message, message);
+    restoreSpawn();
   }
 }
 
